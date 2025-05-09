@@ -1,231 +1,162 @@
+from picamera2 import Picamera2
+from sunfounder_picarx import Picarx
 import cv2
 import numpy as np
-from picarx import Picarx
-from time import sleep
-from picamera2 import Picamera2
+import time
 
-class KalmanFilter1D:
-    def __init__(self, process_variance=1, measurement_variance=2):
-        self.x = 0.0
-        self.P = 1.0
-        self.Q = process_variance
-        self.R = measurement_variance
-
-    def predict(self):
-        self.P += self.Q
-        return self.x
-
-    def update(self, measurement):
-        K = self.P / (self.P + self.R)
-        self.x += K * (measurement - self.x)
-        self.P = (1 - K) * self.P
-        return self.x
-
-# Initialize camera
+# Inizializzazione fotocamera e motori
 picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.preview_configuration.main.size = (640, 480)
+picam2.preview_configuration.main.format = "BGR888"
+picam2.preview_configuration.align()
 picam2.start()
-sleep(2)
 
-frame = picam2.capture_array()
-h, w = frame.shape[:2]
-src_points = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-dst_points = np.float32([[0, 0], [400, 0], [400, 600], [0, 600]])
-perspective_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
-output_size = (400, 600)
-
-# Picarx setup
 px = Picarx()
-px.set_dir_servo_angle(0)
-px.forward(0)
+px.forward(0)  # Assicura che parta fermo
 
-# Kalman Filters and previous values
-prev_left = None
-prev_right = None
-kalman_left = KalmanFilter1D()
-kalman_right = KalmanFilter1D()
-last_angle = 0  # For smoothing
-
-# --- Utility Functions ---
-def split_lines(lines, width):
-    left_lines = []
-    right_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if x1 == x2:
-            continue  # Skip vertical lines
-        slope = (y2 - y1) / (x2 - x1)
-        if slope < -0.5:
-            left_lines.append(line[0])
-        elif slope > 0.5:
-            right_lines.append(line[0])
-    return left_lines, right_lines
-
-def average_line(lines):
-    if len(lines) == 0:
-        return None
-    x, y = [], []
-    for x1, y1, x2, y2 in lines:
-        x.extend([x1, x2])
-        y.extend([y1, y2])
-    poly = np.polyfit(y, x, 1)
-    y1, y2 = 600, 300
-    x1, x2 = int(poly[0]*y1 + poly[1]), int(poly[0]*y2 + poly[1])
-    return (x1, y1, x2, y2)
-
-def shorten_line(line, ratio=0.3):
-    if line is None:
-        return None
-    x1, y1, x2, y2 = line
-    x_mid = int(x1 + (x2 - x1) * ratio)
-    y_mid = int(y1 + (y2 - y1) * ratio)
-    return (x1, y1, x_mid, y_mid)
-
-def detect_lanes(frame, prev_left, prev_right):
-    hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # White lane mask (HLS)
-    lower_white = np.array([0, 200, 0])
-    upper_white = np.array([180, 255, 255])
-    mask_white = cv2.inRange(hls, lower_white, upper_white)
-
-    # Yellow lane mask (HSV)
-    lower_yellow = np.array([15, 80, 80])
-    upper_yellow = np.array([40, 255, 255])
-    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
-
-    combined_mask = cv2.bitwise_or(mask_white, mask_yellow)
-    blurred = cv2.GaussianBlur(combined_mask, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-
-    # Region of Interest (ROI)
-    mask = np.zeros_like(edges)
+# Funzioni di elaborazione (come nel tuo codice originale)
+def region_of_interest(img):
+    height, width = img.shape[:2]
     roi_corners = np.array([[
-        (0, output_size[1]), (0, int(output_size[1]*0.5)),
-        (output_size[0], int(output_size[1]*0.5)), (output_size[0], output_size[1])
+        (int(width * 0.1), height),
+        (int(width * 0.4), int(height * 0.6)),
+        (int(width * 0.6), int(height * 0.6)),
+        (int(width * 0.9), height)
     ]], dtype=np.int32)
+    mask = np.zeros_like(img)
     cv2.fillPoly(mask, roi_corners, 255)
-    masked_edges = cv2.bitwise_and(edges, mask)
+    return cv2.bitwise_and(img, mask)
 
-    lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, threshold=50, minLineLength=10, maxLineGap=50)
-    left_line, right_line = None, None
-    overlay = np.zeros_like(frame)
+def average_slope_intercept(lines):
+    left, right = [], []
+    if lines is None:
+        return None, None
+    for line in lines:
+        for x1, y1, x2, y2 in line:
+            if x2 - x1 == 0:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            angle = np.degrees(np.arctan(slope))
+            if abs(angle) < 20 or abs(angle) > 160:
+                continue
+            intercept = y1 - slope * x1
+            if slope < 0:
+                left.append((slope, intercept))
+            else:
+                right.append((slope, intercept))
+    left_avg = np.mean(left, axis=0) if left else None
+    right_avg = np.mean(right, axis=0) if right else None
+    return left_avg, right_avg
 
-    if lines is not None:
-        left_lines, right_lines = split_lines(lines, output_size[0])
-        left_line = average_line(left_lines)
-        right_line = average_line(right_lines)
+def make_line_points(y1, y2, line_params):
+    if line_params is None:
+        return None
+    slope, intercept = line_params
+    x1 = int((y1 - intercept) / slope)
+    x2 = int((y2 - intercept) / slope)
+    return np.array([x1, y1, x2, y2])
 
-    # Fallback to previous lines if current lines not detected
-    if left_line is None and prev_left is not None:
-        left_line = shorten_line(prev_left, 0.3)
-    if right_line is None and prev_right is not None:
-        right_line = shorten_line(prev_right, 0.3)
+def draw_lines(img, left_line, right_line, left_lost=False, right_lost=False):
+    overlay = img.copy()
+    height = img.shape[0]
 
-    # Draw lines
-    if left_line:
-        cv2.line(overlay, (left_line[0], left_line[1]), (left_line[2], left_line[3]), (0, 255, 0), 5)
-    if right_line:
-        cv2.line(overlay, (right_line[0], right_line[1]), (right_line[2], right_line[3]), (0, 255, 0), 5)
+    if left_line is not None:
+        x1, y1, x2, y2 = left_line
+        color = (0, 0, 255)
+        label = 'SX' if not left_lost else 'SX PERSA'
+        cv2.line(overlay, (x1, y1), (x2, y2), color, 10)
+        cv2.putText(overlay, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-    # Fill region between lines
-    if left_line and right_line:
-        area = np.array([[
-            (left_line[0], left_line[1]), (left_line[2], left_line[3]),
-            (right_line[2], right_line[3]), (right_line[0], right_line[1])
-        ]], dtype=np.int32)
-        cv2.fillPoly(overlay, area, (0, 255, 255))
+    if right_line is not None:
+        x1, y1, x2, y2 = right_line
+        color = (0, 255, 0)
+        label = 'DX' if not right_lost else 'DX PERSA'
+        cv2.line(overlay, (x1, y1), (x2, y2), color, 10)
+        cv2.putText(overlay, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-    return overlay, left_line, right_line, combined_mask
+    if not left_lost and not right_lost:
+        pts = np.array([
+            [left_line[0], left_line[1]],
+            [left_line[2], left_line[3]],
+            [right_line[2], right_line[3]],
+            [right_line[0], right_line[1]]
+        ])
+        cv2.fillPoly(overlay, [pts], (255, 255, 0))
 
-# --- Autonomous Driving Function ---
-def autonomous_drive():
-    global prev_left, prev_right, last_angle
+    return cv2.addWeighted(overlay, 0.8, img, 0.2, 0)
 
-    max_angle = 45
-    max_offset = output_size[0] // 2
+def dynamic_white_threshold(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    avg_brightness = np.mean(hsv[:, :, 2])
+    if avg_brightness > 150:
+        lower_white = np.array([0, 0, 200])
+        upper_white = np.array([180, 25, 255])
+    else:
+        lower_white = np.array([0, 0, 150])
+        upper_white = np.array([180, 40, 255])
+    return lower_white, upper_white
 
+# Main loop
+try:
     while True:
         frame = picam2.capture_array()
-        bird_eye = cv2.warpPerspective(frame, perspective_matrix, output_size)
-        overlay, left_line, right_line, _ = detect_lanes(bird_eye, prev_left, prev_right)
-        combined_view = cv2.addWeighted(bird_eye, 1.0, overlay, 0.7, 0)
+        lower_white, upper_white = dynamic_white_threshold(frame)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+        white_filtered = cv2.bitwise_and(frame, frame, mask=mask)
 
-        prev_left = left_line
-        prev_right = right_line
+        gray = cv2.cvtColor(white_filtered, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        cropped = region_of_interest(edges)
 
-        x_left = kalman_left.update(left_line[2]) if left_line else int(kalman_left.predict())
-        x_right = kalman_right.update(right_line[2]) if right_line else int(kalman_right.predict())
+        lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, threshold=60, minLineLength=80, maxLineGap=30)
+        left_avg, right_avg = average_slope_intercept(lines)
 
-        if left_line and right_line:
-            road_center = (x_left + x_right) // 2
-            frame_center = output_size[0] // 2
-            offset = road_center - frame_center
-            angle = int((offset / max_offset) * max_angle)
-        elif left_line or right_line:
-            frame_center = output_size[0] // 2
-            offset = (x_left + 50 - frame_center) if left_line else (x_right - 50 - frame_center)
-            angle = int((offset / max_offset) * max_angle)
-            angle = np.clip(angle, -15, 15)
-        else:
+        if left_avg is not None and right_avg is not None:
+            if left_avg[0] * right_avg[0] > 0:
+                print("Linee sospette: pendenze simili.")
+                left_avg = None
+                right_avg = None
+
+        height = frame.shape[0]
+        y1, y2 = height, int(height * 0.6)
+        left_line = make_line_points(y1, y2, left_avg)
+        right_line = make_line_points(y1, y2, right_avg)
+
+        left_lost = False
+        right_lost = False
+
+        if left_line is None and right_line is None:
+            print("Entrambe le linee perse.")
             px.stop()
             continue
 
-        # Smooth steering with exponential smoothing
-        smoothed_angle = int(0.7 * last_angle + 0.3 * angle)
-        last_angle = smoothed_angle
+        if left_line is None:
+            left_lost = True
+            print("Linea sinistra persa.")
+            width = frame.shape[1]
+            left_line = np.array([50, height, 150, height - 50])
 
-        px.set_dir_servo_angle(smoothed_angle)
-        px.forward(20)
+        if right_line is None:
+            right_lost = True
+            print("Linea destra persa.")
+            width = frame.shape[1]
+            right_line = np.array([width - 50, height, width - 150, height - 50])
 
-        cv2.imshow("Detected Lanes", overlay)
-        cv2.imshow("Combined View", combined_view)
-
-        if cv2.waitKey(25) & 0xFF == ord('q'):
-            break
-
-    px.stop()
-
-# --- Manual Control Function ---
-def manual_control():
-    print("Manual control active: Use W/A/S/D to drive, Q to quit.")
-    px.set_dir_servo_angle(0)
-    while True:
-        key = cv2.waitKey(0) & 0xFF
-        if key == ord('w'):
+        # Imposta la velocità dei motori
+        if not left_lost and not right_lost:
             px.forward(20)
-        elif key == ord('s'):
-            px.backward(20)
-        elif key == ord('a'):
-            px.set_dir_servo_angle(-30)
-            px.forward(20)
-        elif key == ord('d'):
-            px.set_dir_servo_angle(30)
-            px.forward(20)
-        elif key == ord('x'):
-            px.stop()
-        elif key == ord('q'):
-            px.stop()
-            break
         else:
-            px.set_dir_servo_angle(0)
+            px.forward(5)
 
-# --- Mode Selection ---
-print("Press '8' for autonomous driving or '9' for manual control.")
-while True:
-    key = cv2.waitKey(0) & 0xFF
-    if key == ord('8'):
-        autonomous_drive()
-        break
-    elif key == ord('9'):
-        manual_control()
-        break
-    elif key == ord('q'):
-        print("Exiting...")
-        break
+        output = draw_lines(frame, left_line, right_line, left_lost, right_lost)
+        cv2.imshow("Lane Detection", output)
 
-# Cleanup
-px.stop()
-picam2.close()
-cv2.destroyAllWindows()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    px.stop()
+    picam2.close()
+    cv2.destroyAllWindows()
