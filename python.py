@@ -1,150 +1,115 @@
-import cv2
-import numpy as np
+from picamera2 import Picamera2
+from picarx import Picarx
 import time
-import picar
+import numpy as np
+import cv2
 
-# Inizializza PiCar-X (motori e servo sterzo)
-picar.setup()
-from picar import front_wheels, back_wheels
+def process_video():
+    px = Picarx()
+    cam = Picamera2()
+    cam.configure(cam.create_preview_configuration(main={"size": (640, 480)}))
+    cam.start()
+    time.sleep(2)
 
-fw = front_wheels.Front_Wheels()
-bw = back_wheels.Back_Wheels()
+    last_left_fit = None
+    last_right_fit = None
+    offset_threshold = 30  # soglia per decidere se sterzare
 
-fw.center()
-bw.speed = 0
+    try:
+        while True:
+            frame = cam.capture_array()
+            height, width = frame.shape[:2]
+            roi_height_start = int(height * 0.55)
+            roi_height_end = int(height * 0.95)
 
-# Parametri sliding windows
-n_windows = 9
-margin = 50
-minpix = 50
+            roi = frame[roi_height_start:roi_height_end, 0:width]
+            roi_height, roi_width = roi.shape[:2]
 
-def process_image(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            # Filtro colore
+            blur = cv2.GaussianBlur(roi, (5, 5), 0)
+            hls = cv2.cvtColor(blur, cv2.COLOR_BGR2HLS)
+            white_mask = cv2.inRange(hls, (0, 170, 0), (255, 255, 255))
+            yellow_mask = cv2.inRange(hls, (10, 40, 40), (50, 255, 255))
+            combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
+            masked = cv2.bitwise_and(roi, roi, mask=combined_mask)
+            gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
 
-    histogram = np.sum(binary[binary.shape[0]//2:, :], axis=0)
-    midpoint = histogram.shape[0] // 2
-    leftx_base = np.argmax(histogram[:midpoint])
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+            histogram = np.sum(binary[binary.shape[0]//2:, :], axis=0)
+            midpoint = np.int32(histogram.shape[0]//2)
+            leftx_base = np.argmax(histogram[:midpoint])
+            rightx_base = np.argmax(histogram[midpoint:]) + midpoint
 
-    nonzero = binary.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
+            nonzero = binary.nonzero()
+            nonzeroy = np.array(nonzero[0])
+            nonzerox = np.array(nonzero[1])
 
-    window_height = np.int32(binary.shape[0] // n_windows)
-    leftx_current = leftx_base
-    rightx_current = rightx_base
+            left_lane_inds = ((nonzerox < midpoint) & (binary[nonzeroy, nonzerox] > 0)).nonzero()[0]
+            right_lane_inds = ((nonzerox >= midpoint) & (binary[nonzeroy, nonzerox] > 0)).nonzero()[0]
 
-    left_lane_inds = []
-    right_lane_inds = []
+            leftx = nonzerox[left_lane_inds]
+            lefty = nonzeroy[left_lane_inds]
+            rightx = nonzerox[right_lane_inds]
+            righty = nonzeroy[right_lane_inds]
 
-    out_img = np.dstack((binary, binary, binary)) * 255  # Per disegno a colori
+            left_detected = len(leftx) > 50
+            right_detected = len(rightx) > 50
 
-    for window in range(n_windows):
-        win_y_low = binary.shape[0] - (window + 1) * window_height
-        win_y_high = binary.shape[0] - window * window_height
+            if left_detected:
+                left_fit = np.polyfit(lefty, leftx, 2)
+                last_left_fit = left_fit
+            elif last_left_fit is not None:
+                left_fit = last_left_fit
+                left_detected = True
+            else:
+                left_fit = None
+                left_detected = False
 
-        win_xleft_low = leftx_current - margin
-        win_xleft_high = leftx_current + margin
-        win_xright_low = rightx_current - margin
-        win_xright_high = rightx_current + margin
+            if right_detected:
+                right_fit = np.polyfit(righty, rightx, 2)
+                last_right_fit = right_fit
+            elif last_right_fit is not None:
+                right_fit = last_right_fit
+                right_detected = True
+            else:
+                right_fit = None
+                right_detected = False
 
-        # Disegna finestre
-        cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0,255,0), 2)
-        cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0,255,0), 2)
+            if left_detected and right_detected:
+                ploty = np.linspace(0, binary.shape[0] - 1, binary.shape[0])
+                left_x = left_fit[0]*ploty[-1]**2 + left_fit[1]*ploty[-1] + left_fit[2]
+                right_x = right_fit[0]*ploty[-1]**2 + right_fit[1]*ploty[-1] + right_fit[2]
+                lane_center = (left_x + right_x) / 2
+                car_center = roi_width / 2
+                offset = lane_center - car_center
 
-        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                          (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                           (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+                # Sterzata proporzionale all'offset
+                if abs(offset) > offset_threshold:
+                    angle = np.clip(offset * 0.3, -30, 30)
+                    px.set_dir_servo_angle(int(angle))
+                else:
+                    px.set_dir_servo_angle(0)
 
-        left_lane_inds.append(good_left_inds)
-        right_lane_inds.append(good_right_inds)
+                # Velocità in base alla presenza delle linee
+                px.set_motor_speed(20)
+            elif left_detected or right_detected:
+                # Solo una linea: curva -> riduci velocità
+                px.set_motor_speed(5)
+            else:
+                # Nessuna linea trovata
+                px.stop()
+                print("Linee non rilevate.")
+                continue
 
-        if len(good_left_inds) > minpix:
-            leftx_current = np.int32(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds) > minpix:
-            rightx_current = np.int32(np.mean(nonzerox[good_right_inds]))
+            # Mostra anteprima
+            cv2.imshow("Frame", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-    left_lane_inds = np.concatenate(left_lane_inds)
-    right_lane_inds = np.concatenate(right_lane_inds)
+    finally:
+        cam.stop()
+        px.stop()
+        cv2.destroyAllWindows()
 
-    leftx = nonzerox[left_lane_inds]
-    rightx = nonzerox[right_lane_inds]
-
-    img_center_x = frame.shape[1] // 2
-    cv2.line(out_img, (img_center_x, 0), (img_center_x, frame.shape[0]), (255, 0, 0), 2)  # Asse centrale
-
-    left_dist, right_dist = None, None
-
-    if len(leftx) > 0:
-        left_mean_x = np.int32(np.mean(leftx))
-        left_dist = left_mean_x - img_center_x
-        cv2.circle(out_img, (left_mean_x, frame.shape[0]//2), 8, (255, 0, 255), -1)
-
-    if len(rightx) > 0:
-        right_mean_x = np.int32(np.mean(rightx))
-        right_dist = right_mean_x - img_center_x
-        cv2.circle(out_img, (right_mean_x, frame.shape[0]//2), 8, (255, 0, 255), -1)
-
-    # Decisione direzione
-    if left_dist is not None and right_dist is not None:
-        center_offset = (left_dist + right_dist) / 2
-    elif left_dist is not None:
-        center_offset = left_dist
-    elif right_dist is not None:
-        center_offset = right_dist
-    else:
-        center_offset = 0
-
-    if center_offset < -15:
-        direction = "DESTRA"
-    elif center_offset > 15:
-        direction = "SINISTRA"
-    else:
-        direction = "DRITTO"
-
-    return out_img, left_dist, right_dist, center_offset, direction
-
-def control_car(direction):
-    if direction == "DESTRA":
-        fw.turn(80)   # gira a destra (meno di 90)
-        bw.forward()
-        bw.speed = 30
-    elif direction == "SINISTRA":
-        fw.turn(100)  # gira a sinistra (più di 90)
-        bw.forward()
-        bw.speed = 30
-    else:
-        fw.center()
-        bw.forward()
-        bw.speed = 30
-
-def add_info_overlay(frame, left_dist, right_dist, offset, direction):
-    text = f"L dist: {left_dist} | R dist: {right_dist} | Offset: {offset:.1f}"
-    cv2.putText(frame, text, (30,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
-    cv2.putText(frame, f"Direzione: {direction}", (30,60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
-    return frame
-
-cap = cv2.VideoCapture(0)
-
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        processed_frame, left_dist, right_dist, offset, direction = process_image(frame)
-        control_car(direction)
-        output_frame = add_info_overlay(processed_frame, left_dist, right_dist, offset, direction)
-
-        cv2.imshow("Lane Detection with Info", output_frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
-    fw.center()
-    bw.stop()
+if __name__ == "__main__":
+    process_video()
