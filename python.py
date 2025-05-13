@@ -2,132 +2,128 @@ import cv2
 import numpy as np
 from picarx import Picarx
 from picamera2 import Picamera2
-from filterpy.kalman import KalmanFilter
+import time
 
-# Setup iniziale
-px = Picarx()
+# Inizializza la macchina e la fotocamera
+picarx = Picarx()
 picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(main={"format": 'XRGB8888', "size": (320, 240)}))
+picam2.preview_configuration.main.size = (640, 480)
+picam2.preview_configuration.main.format = "BGR888"
+picam2.configure("preview")
 picam2.start()
+time.sleep(2)  # attesa per stabilizzare la fotocamera
 
-# Crea filtro di Kalman per stimare l'inclinazione delle linee
-def create_kalman():
-    kf = KalmanFilter(dim_x=2, dim_z=1)
-    kf.x = np.array([[0.], [0.]])  # Stato iniziale: [pendenza, offset]
-    kf.F = np.array([[1., 0.], [0., 1.]])  # Matrice di transizione
-    kf.H = np.array([[1., 0.]])  # Matrice di osservazione
-    kf.P *= 1000.  # Incertezza iniziale
-    kf.R = 10  # Rumore della misura
-    kf.Q = 1e-3  # Rumore di processo
-    return kf
+# Trackbar per calibrazione
+def nothing(x):
+    pass
 
-kf_left = create_kalman()
-kf_right = create_kalman()
+cv2.namedWindow("Trackbars")
+cv2.createTrackbar("L - H", "Trackbars", 0, 255, nothing)
+cv2.createTrackbar("L - S", "Trackbars", 0, 255, nothing)
+cv2.createTrackbar("L - V", "Trackbars", 200, 255, nothing)
+cv2.createTrackbar("U - H", "Trackbars", 255, 255, nothing)
+cv2.createTrackbar("U - S", "Trackbars", 50, 255, nothing)
+cv2.createTrackbar("U - V", "Trackbars", 255, 255, nothing)
 
-# Parametri sliding window
-n_windows = 9
-margin = 30
-minpix = 20
+last_direction = 0
 
-def process_frame(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, binary = cv2.threshold(blur, 160, 255, cv2.THRESH_BINARY)
+while True:
+    frame = picam2.capture_array()
+    frame = cv2.resize(frame, (640, 480))
 
-    histogram = np.sum(binary[binary.shape[0]//2:, :], axis=0)
-    midpoint = np.int32(histogram.shape[0] // 2)
-    leftx_base = np.argmax(histogram[:midpoint])
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+    # ROI
+    tl = (70,220)
+    bl = (0,472)
+    tr = (570,220)
+    br = (640,472)
 
-    window_height = np.int32(binary.shape[0] // n_windows)
-    nonzero = binary.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
+    for pt in [tl, bl, tr, br]:
+        cv2.circle(frame, pt, 5, (0,0,255), -1)
 
-    leftx_current = leftx_base
-    rightx_current = rightx_base
+    pts1 = np.float32([tl, bl, tr, br])
+    pts2 = np.float32([[0,0], [0,480], [640,0], [640,480]])
+    matrix = cv2.getPerspectiveTransform(pts1, pts2)
+    transformed_frame = cv2.warpPerspective(frame, matrix, (640, 480))
 
-    left_lane_inds = []
-    right_lane_inds = []
+    # Sogliatura HSV
+    hsv = cv2.cvtColor(transformed_frame, cv2.COLOR_BGR2HSV)
+    l_h = cv2.getTrackbarPos("L - H", "Trackbars")
+    l_s = cv2.getTrackbarPos("L - S", "Trackbars")
+    l_v = cv2.getTrackbarPos("L - V", "Trackbars")
+    u_h = cv2.getTrackbarPos("U - H", "Trackbars")
+    u_s = cv2.getTrackbarPos("U - S", "Trackbars")
+    u_v = cv2.getTrackbarPos("U - V", "Trackbars")
+    lower = np.array([l_h, l_s, l_v])
+    upper = np.array([u_h, u_s, u_v])
+    mask = cv2.inRange(hsv, lower, upper)
 
-    for window in range(n_windows):
-        win_y_low = binary.shape[0] - (window + 1) * window_height
-        win_y_high = binary.shape[0] - window * window_height
-        win_xleft_low = leftx_current - margin
-        win_xleft_high = leftx_current + margin
-        win_xright_low = rightx_current - margin
-        win_xright_high = rightx_current + margin
+    # Istogramma
+    histogram = np.sum(mask[mask.shape[0]//2:, :], axis=0)
+    midpoint = int(histogram.shape[0]/2)
+    left_base = np.argmax(histogram[:midpoint])
+    right_base = np.argmax(histogram[midpoint:]) + midpoint
 
-        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                          (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                           (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+    # Sliding window
+    y = 472
+    window_height = 40
+    left_x, right_x = [], []
 
-        left_lane_inds.append(good_left_inds)
-        right_lane_inds.append(good_right_inds)
+    while y > 0:
+        left_win = mask[y-window_height:y, left_base-50:left_base+50]
+        right_win = mask[y-window_height:y, right_base-50:right_base+50]
 
-        if len(good_left_inds) > minpix:
-            leftx_current = np.int32(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds) > minpix:
-            rightx_current = np.int32(np.mean(nonzerox[good_right_inds]))
+        contours, _ = cv2.findContours(left_win, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            M = cv2.moments(contours[0])
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                left_base = left_base - 50 + cx
+                left_x.append(left_base)
 
-    left_lane_inds = np.concatenate(left_lane_inds)
-    right_lane_inds = np.concatenate(right_lane_inds)
+        contours, _ = cv2.findContours(right_win, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            M = cv2.moments(contours[0])
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                right_base = right_base - 50 + cx
+                right_x.append(right_base)
 
-    leftx = nonzerox[left_lane_inds]
-    lefty = nonzeroy[left_lane_inds]
-    rightx = nonzerox[right_lane_inds]
-    righty = nonzeroy[right_lane_inds]
+        y -= window_height
 
-    left_fit = right_fit = None
-    left_detected = right_detected = False
+    # Calcolo centro corsia e sterzata
+    frame_center = 320
+    if left_x and right_x:
+        lane_center = (int(np.mean(left_x)) + int(np.mean(right_x))) // 2
+        error = lane_center - frame_center
+        angle = -int(error / 3)
+        last_direction = angle
+        picarx.forward(20)
+        picarx.set_dir_servo_angle(angle)
 
-    if len(leftx) > 100:
-        left_fit = np.polyfit(lefty, leftx, 1)
-        kf_left.predict()
-        kf_left.update(left_fit[0])
-        left_detected = True
+    elif left_x and not right_x:
+        lane_center = int(np.mean(left_x)) + 100
+        error = lane_center - frame_center
+        angle = -int(error / 3)
+        last_direction = angle
+        picarx.forward(20)
+        picarx.set_dir_servo_angle(angle)
+
+    elif right_x and not left_x:
+        lane_center = int(np.mean(right_x)) - 100
+        error = lane_center - frame_center
+        angle = -int(error / 3)
+        last_direction = angle
+        picarx.forward(20)
+        picarx.set_dir_servo_angle(angle)
+
     else:
-        kf_left.predict()
+        picarx.forward(20)
+        picarx.set_dir_servo_angle(last_direction)
 
-    if len(rightx) > 100:
-        right_fit = np.polyfit(righty, rightx, 1)
-        kf_right.predict()
-        kf_right.update(right_fit[0])
-        right_detected = True
-    else:
-        kf_right.predict()
+    # Mostra immagini (facoltativo)
+    cv2.imshow("Frame", frame)
+    cv2.imshow("Mask", mask)
+    if cv2.waitKey(1) == 27:  # ESC per uscire
+        break
 
-    center = frame.shape[1] // 2
-    deviation = 0
-
-    if left_detected and right_detected:
-        lane_center = (np.polyval(left_fit, frame.shape[0]) + np.polyval(right_fit, frame.shape[0])) / 2
-        deviation = lane_center - center
-    elif left_detected:
-        lane_center = np.polyval(left_fit, frame.shape[0]) + margin
-        deviation = lane_center - center
-    elif right_detected:
-        lane_center = np.polyval(right_fit, frame.shape[0]) - margin
-        deviation = lane_center - center
-
-    return deviation
-
-# Main loop
-try:
-    while True:
-        frame = picam2.capture_array()
-        deviation = process_frame(frame)
-
-        if deviation > 20:
-            px.set_dir_servo_angle(-20)
-        elif deviation < -20:
-            px.set_dir_servo_angle(20)
-        else:
-            px.set_dir_servo_angle(0)
-
-        px.forward(10)
-
-except KeyboardInterrupt:
-    px.stop()
-    picam2.stop()
+cv2.destroyAllWindows()
