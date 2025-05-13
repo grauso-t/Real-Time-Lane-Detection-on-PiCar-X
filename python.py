@@ -1,207 +1,140 @@
 import cv2
 import numpy as np
 from picarx import Picarx
-from time import sleep
-from picamera2 import Picamera2
+from simple_pid import PID
+import time
 
-# Inizializza la camera
-picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
-picam2.start()
-sleep(2)
+# Inizializzazione
+picarx = Picarx()
+cap = cv2.VideoCapture(0)
+pid = PID(Kp=0.5, Ki=0.01, Kd=0.1, setpoint=0)
+pid.output_limits = (-30, 30)
 
-# Inizializza Picarx
-px = Picarx()
-px.set_dir_servo_angle(0)
+frame_center = 320  # Mezzanotte per una camera 640x480
+last_direction = 0
 
-# Ottieni le dimensioni del frame
-frame = picam2.capture_array()
-h, w = frame.shape[:2]
+# Media mobile
+def media_mobile(valori, N=5):
+    if len(valori) < N:
+        return int(np.mean(valori))
+    return int(np.mean(valori[-N:]))
 
-# Definisci i punti per la ROI (Region of Interest)
-roi_points = np.array([
-    [0, h],
-    [w//3, h//2],
-    [2*w//3, h//2],
-    [w, h]
-], dtype=np.int32)
+def prospettiva(frame):
+    h, w = frame.shape[:2]
+    src = np.float32([[0, h], [w, h], [w//2 + 50, h//2], [w//2 - 50, h//2]])
+    dst = np.float32([[w//4, h], [w*3//4, h], [w*3//4, 0], [w//4, 0]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(frame, M, (w, h))
 
-# Definisci i punti per la trasformazione Bird's Eye
-src_points = np.float32([
-    [w//3, h//2],    # Top-left della ROI
-    [2*w//3, h//2],  # Top-right della ROI
-    [w, h],          # Bottom-right della ROI
-    [0, h]           # Bottom-left della ROI
-])
+def regione_interesse(img):
+    mask = np.zeros_like(img)
+    h, w = img.shape[:2]
+    roi_corners = np.array([[(0, h), (w, h), (w, h//2), (0, h//2)]], dtype=np.int32)
+    cv2.fillPoly(mask, roi_corners, 255)
+    return cv2.bitwise_and(img, mask)
 
-# Punti di destinazione per la trasformazione bird's eye
-dst_points = np.float32([[0, 0], [400, 0], [400, 600], [0, 600]])
-matrix = cv2.getPerspectiveTransform(src_points, dst_points)
-output_size = (400, 600)
-
-prev_left = None
-prev_right = None
-
-def separa_linee(lines, width):
-    left_lines = []
-    right_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if x1 == x2:
-            continue
-        slope = (y2 - y1) / (x2 - x1)
-        if slope < -0.5:
-            left_lines.append(line[0])
-        elif slope > 0.5:
-            right_lines.append(line[0])
-    return left_lines, right_lines
-
-def media_linea(linee):
-    if len(linee) == 0:
-        return None
-    x = []
-    y = []
-    for x1, y1, x2, y2 in linee:
-        x += [x1, x2]
-        y += [y1, y2]
-    poly = np.polyfit(y, x, 1)
-    y1, y2 = 600, 300
-    x1, x2 = int(poly[0]*y1 + poly[1]), int(poly[0]*y2 + poly[1])
-    return (x1, y1, x2, y2)
-
-def accorcia_linea(linea, percentuale=0.3):
-    if linea is None:
-        return None
-    x1, y1, x2, y2 = linea
-    x_mid = int(x1 + (x2 - x1) * percentuale)
-    y_mid = int(y1 + (y2 - y1) * percentuale)
-    return (x1, y1, x_mid, y_mid)
-
-def rileva_corsie(frame, prev_left, prev_right):
-    hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    lower_white_hls = np.array([0, 200, 0])
-    upper_white_hls = np.array([180, 255, 255])
-    mask_white_hls = cv2.inRange(hls, lower_white_hls, upper_white_hls)
-
-    lower_yellow_hsv = np.array([15, 80, 80])
-    upper_yellow_hsv = np.array([40, 255, 255])
-    mask_yellow_hsv = cv2.inRange(hsv, lower_yellow_hsv, upper_yellow_hsv)
-
-    combined_mask = cv2.bitwise_or(mask_white_hls, mask_yellow_hsv)
-
-    blur = cv2.GaussianBlur(combined_mask, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-
-    # Non applichiamo la ROI qui, poiché è già stata applicata prima
-    masked_edges = edges
-
-    lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, threshold=50, minLineLength=10, maxLineGap=50)
-
-    line_image = np.zeros_like(frame)
-    left_line, right_line = None, None
-
-    if lines is not None:
-        left_lines, right_lines = separa_linee(lines, output_size[0])
-        left_line = media_linea(left_lines)
-        right_line = media_linea(right_lines)
-
-    if left_line is None and prev_left is not None:
-        left_line = accorcia_linea(prev_left, 0.3)
-    if right_line is None and prev_right is not None:
-        right_line = accorcia_linea(prev_right, 0.3)
-
-    if left_line:
-        cv2.line(line_image, (left_line[0], left_line[1]), (left_line[2], left_line[3]), (0, 255, 0), 5)
-    if right_line:
-        cv2.line(line_image, (right_line[0], right_line[1]), (right_line[2], right_line[3]), (0, 255, 0), 5)
-
-    if left_line and right_line:
-        punti = np.array([[ (left_line[0], left_line[1]), (left_line[2], left_line[3]),
-                            (right_line[2], right_line[3]), (right_line[0], right_line[1]) ]], dtype=np.int32)
-        cv2.fillPoly(line_image, punti, (0, 255, 255))
-
-    return line_image, left_line, right_line, mask_white_hls, mask_yellow_hsv, combined_mask, edges
-
-# Loop principale
 while True:
-    # Cattura il frame
-    frame = picam2.capture_array()
-    frame_with_roi = frame.copy()
-    
-    # Disegna la ROI sul frame originale per visualizzazione
-    cv2.polylines(frame_with_roi, [roi_points], True, (0, 0, 255), 2)
-    
-    # Crea una maschera per la ROI
-    roi_mask = np.zeros_like(frame[:,:,0])
-    cv2.fillPoly(roi_mask, [roi_points], 255)
-    
-    # Applica la maschera ROI all'immagine originale
-    masked_frame = cv2.bitwise_and(frame, frame, mask=roi_mask)
-    
-    # Applica la trasformazione bird's eye alla ROI
-    bird_eye = cv2.warpPerspective(masked_frame, matrix, output_size)
-    
-    # Applica il rilevamento delle corsie sulla vista bird's eye
-    overlay, prev_left, prev_right, white_mask, yellow_mask, combined_mask, edges = rileva_corsie(
-        bird_eye, prev_left, prev_right)
-    
-    # Combina bird's eye con overlay
-    combined = cv2.addWeighted(bird_eye, 1.0, overlay, 0.7, 0)
-
-    # Logica di steering
-    max_angle = 30
-    max_offset = output_size[0] // 2
-
-    if prev_left is not None and prev_right is not None:
-        centro_strada = (prev_left[2] + prev_right[2]) // 2
-        centro_frame = output_size[0] // 2
-        offset = centro_strada - centro_frame
-
-        angle = int((offset / max_offset) * max_angle)
-        angle = np.clip(angle, -max_angle, max_angle)
-
-        print(f"Offset: {offset} px -> Angolo sterzo: {angle}°")
-        px.set_dir_servo_angle(angle)
-        px.forward(20)
-
-    elif prev_left is not None or prev_right is not None:
-        print("Una linea visibile. Riduzione sterzata.")
-        centro_frame = output_size[0] // 2
-
-        if prev_left is not None:
-            offset = (prev_left[2] + 50) - centro_frame
-        else:
-            offset = (prev_right[2] - 50) - centro_frame
-
-        angle = int((offset / max_offset) * max_angle)
-        angle = np.clip(angle, -15, 15)
-
-        print(f"Offset stimato: {offset} -> Angolo limitato: {angle}")
-        px.set_dir_servo_angle(angle)
-        px.forward(10)
-
-    else:
-        print("Linee non rilevate. Stop.")
-        px.stop()
-
-    # Visualizzazione
-    cv2.imshow("Vista originale", frame)
-    cv2.imshow("Regione di interesse", frame_with_roi)
-    cv2.imshow("ROI applicata", masked_frame)
-    cv2.imshow("Bird Eye View", bird_eye)
-    cv2.imshow("Edge Detection", edges)
-    cv2.imshow("Maschera Bianca (HLS)", white_mask)
-    cv2.imshow("Maschera Gialla (HSV)", yellow_mask)
-    cv2.imshow("Maschera Combinata", combined_mask)
-    cv2.imshow("Corsie rilevate", overlay)
-    cv2.imshow("Vista con sovrapposizione", combined)
-
-    if cv2.waitKey(25) & 0xFF == ord('q'):
+    ret, frame = cap.read()
+    if not ret:
         break
 
-# Arresto finale
-px.stop()
-picam2.close()
+    frame = cv2.resize(frame, (640, 480))
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+    # Filtro per giallo/bianco
+    lower = np.array([0, 0, 180])
+    upper = np.array([255, 30, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+
+    roi = regione_interesse(mask)
+    bird_eye = prospettiva(roi)
+
+    histogram = np.sum(bird_eye[bird_eye.shape[0]//2:, :], axis=0)
+    midpoint = np.int(histogram.shape[0]//2)
+    left_base = np.argmax(histogram[:midpoint])
+    right_base = np.argmax(histogram[midpoint:]) + midpoint
+
+    nwindows = 9
+    window_height = np.int(bird_eye.shape[0] // nwindows)
+    nonzero = bird_eye.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+
+    left_current = left_base
+    right_current = right_base
+    margin = 50
+    minpix = 50
+
+    left_lane_inds = []
+    right_lane_inds = []
+
+    out_img = np.dstack((bird_eye, bird_eye, bird_eye)) * 255
+
+    for window in range(nwindows):
+        win_y_low = bird_eye.shape[0] - (window + 1) * window_height
+        win_y_high = bird_eye.shape[0] - window * window_height
+        win_xleft_low = left_current - margin
+        win_xleft_high = left_current + margin
+        win_xright_low = right_current - margin
+        win_xright_high = right_current + margin
+
+        cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 255, 0), 2)
+        cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
+
+        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                          (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                           (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
+
+        if len(good_left_inds) > minpix:
+            left_current = np.int(np.mean(nonzerox[good_left_inds]))
+        if len(good_right_inds) > minpix:
+            right_current = np.int(np.mean(nonzerox[good_right_inds]))
+
+    left_lane_inds = np.concatenate(left_lane_inds)
+    right_lane_inds = np.concatenate(right_lane_inds)
+
+    left_x = nonzerox[left_lane_inds]
+    right_x = nonzerox[right_lane_inds]
+
+    left_x_filtered, right_x_filtered = [], []
+    if len(left_x) >= 3:
+        left_x_filtered.append(int(np.mean(left_x)))
+    if len(right_x) >= 3:
+        right_x_filtered.append(int(np.mean(right_x)))
+
+    if left_x_filtered and right_x_filtered:
+        lane_center = (media_mobile(left_x_filtered) + media_mobile(right_x_filtered)) // 2
+    elif left_x_filtered:
+        lane_center = media_mobile(left_x_filtered) + 100
+    elif right_x_filtered:
+        lane_center = media_mobile(right_x_filtered) - 100
+    else:
+        lane_center = None
+
+    if lane_center is not None:
+        error = lane_center - frame_center
+        angle = -int(pid(error))
+        last_direction = angle
+        picarx.forward(20)
+        picarx.set_dir_servo_angle(angle)
+    else:
+        picarx.forward(20)
+        picarx.set_dir_servo_angle(last_direction)
+
+    # Finestre di output
+    cv2.imshow("Video originale", frame)
+    cv2.imshow("Regione di interesse", roi)
+    cv2.imshow("Visione prospettica (bird-eye)", bird_eye)
+    cv2.imshow("Sliding Windows", out_img)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
 cv2.destroyAllWindows()
+picarx.stop()
