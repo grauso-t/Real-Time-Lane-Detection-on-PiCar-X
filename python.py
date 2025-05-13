@@ -44,8 +44,11 @@ while True:
     matrix = cv2.getPerspectiveTransform(pts1, pts2)
     topview = cv2.warpPerspective(frame, matrix, (640, 480))
 
-    # Conversione HSV e maschera
+    # Conversione HSV
     hsv = cv2.cvtColor(topview, cv2.COLOR_BGR2HSV)
+    cv2.imshow("HSV", hsv)
+
+    # Maschera in base ai valori HSV selezionati
     l_h = cv2.getTrackbarPos("L - H", "Trackbars")
     l_s = cv2.getTrackbarPos("L - S", "Trackbars")
     l_v = cv2.getTrackbarPos("L - V", "Trackbars")
@@ -55,18 +58,28 @@ while True:
     lower = np.array([l_h, l_s, l_v])
     upper = np.array([u_h, u_s, u_v])
     mask = cv2.inRange(hsv, lower, upper)
+    cv2.imshow("Mask", mask)
 
-    # Calcolo istogramma per centro corsia
+    # Calcolo istogramma
     histogram = np.sum(mask[mask.shape[0] // 2:, :], axis=0)
     midpoint = int(histogram.shape[0] / 2)
     left_base = np.argmax(histogram[:midpoint])
     right_base = np.argmax(histogram[midpoint:]) + midpoint
 
-    # Sliding window per individuare le linee
+    # Istogramma visivo
+    hist_img = np.zeros((300, 640, 3), dtype=np.uint8)
+    if histogram.max() > 0:
+        hist_norm = (histogram / histogram.max()) * 300
+    else:
+        hist_norm = histogram
+    for x, val in enumerate(hist_norm):
+        cv2.line(hist_img, (x, 300), (x, 300 - int(val)), (255, 255, 255), 1)
+    cv2.imshow("Histogram", hist_img)
+
+    # Sliding window
     y = 472
     lx = []
     rx = []
-
     while y > 0:
         img_l = mask[y - 40:y, max(0, left_base - 50):min(640, left_base + 50)]
         contours_l, _ = cv2.findContours(img_l, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -88,33 +101,38 @@ while True:
 
         y -= 40
 
+    # Overlay con linee rilevate
+    line_overlay = topview.copy()
+    for x in lx:
+        cv2.circle(line_overlay, (int(x), y), 5, (0, 0, 255), -1)  # sinistra
+    for x in rx:
+        cv2.circle(line_overlay, (int(x), y), 5, (255, 0, 0), -1)  # destra
+    cv2.imshow("Detected Lines", line_overlay)
+
     # Controllo dello sterzo
     if lx and rx:
         left_mean = np.mean(lx)
         right_mean = np.mean(rx)
         lane_center = (left_mean + right_mean) / 2
         frame_center = 640 / 2
-
         deviation = lane_center - frame_center
-        threshold = 20  # tolleranza
+        threshold = 20
 
         if abs(deviation) < threshold:
-            px.set_dir_servo_angle(0)  # dritto
+            px.set_dir_servo_angle(0)
         else:
             angle = -int((deviation / frame_center) * 30)
             angle = max(-30, min(30, angle))
             px.set_dir_servo_angle(angle)
     else:
-        # Se una o entrambe le linee non sono visibili
         px.stop()
         print("Linee non trovate, fermo.")
 
-    # Mostra finestre
-    cv2.imshow('Original', frame)
+    # Mostra immagini
+    cv2.imshow("Original", frame)
     cv2.imshow("Top View", topview)
-    cv2.imshow("Mask", mask)
 
-    # Uscita con ESC
+    # Esci con ESC
     if cv2.waitKey(delay) == 27:
         break
 
