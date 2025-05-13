@@ -1,167 +1,136 @@
 import cv2
 import numpy as np
+from picamera2 import Picamera2
 from picarx import Picarx
-from time import sleep
+import time
 
-# Setup
+# Inizializza Picarx
 px = Picarx()
-px.forward(0)  # Ferma il veicolo all'inizio
+px.set_dir_servo_angle(0)
+px.forward(10)
 
-# Parametri sliding window
-n_windows = 9
-margin = 50
-minpix = 50
-buffer_size = 5  # Per media mobile
+# Configura e avvia Picamera2
+picam2 = Picamera2()
+preview_config = picam2.create_preview_configuration(
+    main={"size": (640, 480)},
+    lores={"size": (320, 240)},
+    display="lores"
+)
+picam2.configure(preview_config)
+picam2.start()
+print("Picamera2 avviata, inizio acquisizione...")
 
-# Buffers per media mobile
-left_x_buffer = []
-right_x_buffer = []
+# Parametri
+fps = 24
+frame_time = int(1000 / fps)
+width, height = picam2.stream_configuration["main"]["size"]
+roi_w = width
+roi_h = height // 4
+x0, y0 = 0, height - roi_h
+dst_pts = np.float32([
+    [0, roi_h],
+    [roi_w, roi_h],
+    [roi_w, 0],
+    [0, 0]
+])
 
-# Funzione per filtrare con media mobile
-def moving_average(buffer, new_value, size):
-    buffer.append(new_value)
-    if len(buffer) > size:
-        buffer.pop(0)
-    return int(np.mean(buffer))
-
-# Funzione per maschera ROI
-def region_of_interest(img):
-    height, width = img.shape[:2]
-    mask = np.zeros_like(img)
-    polygon = np.array([[
-        (0, height),
-        (0, int(height*0.6)),
-        (width, int(height*0.6)),
-        (width, height),
-    ]], np.int32)
-    cv2.fillPoly(mask, polygon, 255)
-    return cv2.bitwise_and(img, mask)
-
-# Funzione per prospettiva
-def warp_perspective(img):
-    height, width = img.shape[:2]
-    src = np.float32([
-        [width*0.2, height*0.6],
-        [width*0.8, height*0.6],
-        [width*0.1, height],
-        [width*0.9, height]
-    ])
-    dst = np.float32([
-        [0, 0],
-        [width, 0],
-        [0, height],
-        [width, height]
-    ])
-    M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(img, M, (width, height))
-    return warped
-
-# Funzione per trovare le linee con sliding windows
-def find_lane_lines(binary_img):
-    histogram = np.sum(binary_img[binary_img.shape[0]//2:, :], axis=0)
-    midpoint = histogram.shape[0] // 2
-    left_base = np.argmax(histogram[:midpoint])
-    right_base = np.argmax(histogram[midpoint:]) + midpoint
-
-    window_height = binary_img.shape[0] // n_windows
-    nonzero = binary_img.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
-
-    left_x_current = left_base
-    right_x_current = right_base
-
-    left_lane_inds = []
-    right_lane_inds = []
-
-    out_img = np.dstack((binary_img, binary_img, binary_img)) * 255
-
-    for window in range(n_windows):
-        win_y_low = binary_img.shape[0] - (window + 1) * window_height
-        win_y_high = binary_img.shape[0] - window * window_height
-        win_xleft_low = left_x_current - margin
-        win_xleft_high = left_x_current + margin
-        win_xright_low = right_x_current - margin
-        win_xright_high = right_x_current + margin
-
-        cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0,255,0), 2)
-        cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0,255,0), 2)
-
-        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                          (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                           (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
-
-        left_lane_inds.append(good_left_inds)
-        right_lane_inds.append(good_right_inds)
-
-        if len(good_left_inds) > minpix:
-            left_x_current = int(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds) > minpix:
-            right_x_current = int(np.mean(nonzerox[good_right_inds]))
-
-    left_lane_inds = np.concatenate(left_lane_inds)
-    right_lane_inds = np.concatenate(right_lane_inds)
-
-    left_x = nonzerox[left_lane_inds]
-    right_x = nonzerox[right_lane_inds]
-
-    # Sicurezza: se troppi pochi punti, considera non affidabile
-    if len(left_x) < 100 or len(right_x) < 100:
-        return None, out_img
-
-    left_mean = int(np.mean(left_x))
-    right_mean = int(np.mean(right_x))
-
-    left_filtered = moving_average(left_x_buffer, left_mean, buffer_size)
-    right_filtered = moving_average(right_x_buffer, right_mean, buffer_size)
-
-    center = (left_filtered + right_filtered) // 2
-    return center, out_img
-
-# Loop principale
-cap = cv2.VideoCapture(0)
+def avg_line(segs):
+    if not segs: return None
+    xs, ys = [], []
+    for x1,y1,x2,y2 in segs:
+        xs += [x1,x2]
+        ys += [y1,y2]
+    m, q = np.polyfit(ys, xs, 1)
+    return (int(m*roi_h + q), roi_h, int(q), 0)
 
 try:
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        frame = picam2.capture_array()
+        roi = frame[y0:y0 + roi_h, x0:x0 + roi_w]
+
+        # Adatta in base alla tua camera
+        src_pts = np.float32([
+            [0, roi_h],
+            [roi_w, roi_h],
+            [roi_w, 20],
+            [20, 0]
+        ])
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
+        bird = cv2.warpPerspective(roi, M, (roi_w, roi_h))
+
+        # Maschere colore
+        hls = cv2.cvtColor(bird, cv2.COLOR_BGR2HLS)
+        mask_w = cv2.inRange(hls, np.array([0,200,0],np.uint8), np.array([180,255,80],np.uint8))
+        hsv = cv2.cvtColor(bird, cv2.COLOR_BGR2HSV)
+        mask_y = cv2.inRange(hsv, np.array([18,80,80],np.uint8), np.array([35,255,255],np.uint8))
+        mask = cv2.bitwise_or(mask_w, mask_y)
+        filtered = cv2.bitwise_and(bird, bird, mask=mask)
+
+        # Edges
+        gray = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5,5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+
+        # Linee
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=20, maxLineGap=50)
+        left_segs, right_segs = [], []
+
+        if lines is not None:
+            for l in lines:
+                x1,y1,x2,y2 = l[0]
+                if x2==x1: continue
+                slope = (y2-y1)/(x2-x1)
+                if abs(slope)<0.3: continue
+                if slope < 0:
+                    left_segs.append((x1,y1,x2,y2))
+                else:
+                    right_segs.append((x1,y1,x2,y2))
+
+        left_avg  = avg_line(left_segs)  or (0,roi_h,0,0)
+        right_avg = avg_line(right_segs) or (roi_w-1,roi_h,roi_w-1,0)
+
+        # Deviazione dal centro
+        center_line = (left_avg[0] + right_avg[0]) // 2
+        deviation   = center_line - (roi_w // 2)
+
+        # PID semplice: proporzionale
+        k = 0.1  # coefficiente di guadagno (aumenta per sterzate più aggressive)
+        angle = int(np.clip(k * deviation, -40, 40))
+        px.set_dir_servo_angle(angle)
+
+        # Visualizzazione
+        overlay = np.zeros_like(bird)
+        for x1,y1,x2,y2 in left_segs:
+            cv2.line(overlay, (x1,y1),(x2,y2),(255,100,100),2)
+        for x1,y1,x2,y2 in right_segs:
+            cv2.line(overlay, (x1,y1),(x2,y2),(100,255,100),2)
+        cv2.line(overlay, (left_avg[0],left_avg[1]),(left_avg[2],left_avg[3]),(255,0,0),4)
+        cv2.line(overlay, (right_avg[0],right_avg[1]),(right_avg[2],right_avg[3]),(0,255,0),4)
+
+        pts = np.array([[left_avg[0],left_avg[1]],
+                        [left_avg[2],left_avg[3]],
+                        [right_avg[2],right_avg[3]],
+                        [right_avg[0],right_avg[1]]], np.int32)
+        fill = np.zeros_like(bird)
+        cv2.fillPoly(fill, [pts], (0,255,255))
+        bird_vis = cv2.addWeighted(overlay, 1, fill, 0.3, 0)
+
+        back = cv2.warpPerspective(bird_vis, Minv, (roi_w, roi_h))
+        out = frame.copy()
+        roi_area = out[y0:y0+roi_h, x0:x0+roi_w]
+        out[y0:y0+roi_h, x0:x0+roi_w] = cv2.addWeighted(roi_area, 0.8, back, 1, 0)
+
+        cv2.imshow('Frame con Lanes', out)
+        cv2.imshow('Bird’s-eye', bird)
+        cv2.imshow('Edges', edges)
+
+        if cv2.waitKey(frame_time) & 0xFF == ord('q'):
             break
-
-        roi = region_of_interest(frame)
-        warped = warp_perspective(roi)
-        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
-
-        center, debug_img = find_lane_lines(binary)
-
-        if center is not None:
-            img_center = binary.shape[1] // 2
-            error = img_center - center
-            if abs(error) < 20:
-                px.set_dir_servo_angle(0)
-            elif error > 0:
-                px.set_dir_servo_angle(20)
-            else:
-                px.set_dir_servo_angle(-20)
-            px.forward(20)
-        else:
-            px.forward(0)
-            px.set_dir_servo_angle(0)
-
-        # Finestre di output per debug
-        cv2.imshow("Original", frame)
-        cv2.imshow("ROI", roi)
-        cv2.imshow("Warped", warped)
-        cv2.imshow("Sliding Windows", debug_img)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-except KeyboardInterrupt:
-    print("Interrotto manualmente")
 
 finally:
-    cap.release()
+    print("Pulizia in corso...")
+    picam2.stop()
+    px.stop()
+    px.set_dir_servo_angle(0)
     cv2.destroyAllWindows()
-    px.forward(0)
