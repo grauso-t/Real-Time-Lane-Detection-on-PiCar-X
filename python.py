@@ -1,142 +1,177 @@
 import cv2
 import numpy as np
+import time
 from picamera2 import Picamera2
 from picarx import Picarx
-import time
 
-# Inizializza Picar-X
-px = Picarx()
-speed = 10
-px.forward(speed)
 
-# Inizializza la PiCamera2
-picam2 = Picamera2()
-picam2.preview_configuration.main.size = (640, 480)
-picam2.preview_configuration.main.format = "BGR888"
-picam2.configure("preview")
-picam2.start()
-time.sleep(1)  # Stabilizzazione della camera
+def lane_detection_control():
+    """
+    Acquisisce immagini dalla PiCamera2, effettua rilevamento di corsie e controlla PiCar-X.
+    - Velocità 20% quando entrambe le linee sono rilevate.
+    - Velocità 5% quando viene rilevata solo una linea.
+    - Ferma il veicolo se non vengono rilevate linee.
+    - Sterzata calcolata con angolo massimo di 40° in base alla posizione centrale della corsia.
+    """
+    # Inizializza PiCamera2
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (640, 480)})
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2)  # Lascia stabilizzare l'esposizione
 
-delay = 33  # ~30 FPS
+    # Inizializza il robot PiCar-X
+    px = Picarx()
+    px.set_dir_servo_angle(0)  # Centro
 
-# Funzione nulla per le trackbar
-def nothing(x):
-    pass
+    # Variabili per mantenere l'ultimo fit dei polinomi
+    last_left_fit = None
+    last_right_fit = None
 
-# Trackbar per selezionare l'intervallo HSV
-cv2.namedWindow("Trackbars")
-cv2.createTrackbar("L - H", "Trackbars", 0, 255, nothing)
-cv2.createTrackbar("L - S", "Trackbars", 0, 255, nothing)
-cv2.createTrackbar("L - V", "Trackbars", 200, 255, nothing)
-cv2.createTrackbar("U - H", "Trackbars", 255, 255, nothing)
-cv2.createTrackbar("U - S", "Trackbars", 50, 255, nothing)
-cv2.createTrackbar("U - V", "Trackbars", 255, 255, nothing)
+    try:
+        while True:
+            # Acquisisci frame
+            frame = picam2.capture_array()
+            height, width = frame.shape[:2]
 
-while True:
-    # Cattura immagine dalla PiCamera2
-    image = picam2.capture_array()
-    frame = cv2.resize(image, (640, 480))
+            # Definisci ROI: parte bassa del frame
+            y_start = int(height * 0.55)
+            y_end = int(height * 0.95)
+            roi = frame[y_start:y_end, :]
 
-    # Trasformazione prospettica (Top view)
-    tl = (70, 220); bl = (0, 472); tr = (570, 220); br = (640, 472)
-    pts1 = np.float32([tl, bl, tr, br])
-    pts2 = np.float32([[0, 0], [0, 480], [640, 0], [640, 480]])
-    matrix = cv2.getPerspectiveTransform(pts1, pts2)
-    topview = cv2.warpPerspective(frame, matrix, (640, 480))
+            # Pre-elaborazione: blur + HLS + maschere
+            blur = cv2.GaussianBlur(roi, (5, 5), 0)
+            hls = cv2.cvtColor(blur, cv2.COLOR_BGR2HLS)
 
-    # Conversione HSV
-    hsv = cv2.cvtColor(topview, cv2.COLOR_BGR2HSV)
-    cv2.imshow("HSV", hsv)
+            # Maschera bianco
+            lower_white = np.array([0, 170, 0], dtype=np.uint8)
+            upper_white = np.array([255, 255, 255], dtype=np.uint8)
+            white_mask = cv2.inRange(hls, lower_white, upper_white)
 
-    # Maschera in base ai valori HSV selezionati
-    l_h = cv2.getTrackbarPos("L - H", "Trackbars")
-    l_s = cv2.getTrackbarPos("L - S", "Trackbars")
-    l_v = cv2.getTrackbarPos("L - V", "Trackbars")
-    u_h = cv2.getTrackbarPos("U - H", "Trackbars")
-    u_s = cv2.getTrackbarPos("U - S", "Trackbars")
-    u_v = cv2.getTrackbarPos("U - V", "Trackbars")
-    lower = np.array([l_h, l_s, l_v])
-    upper = np.array([u_h, u_s, u_v])
-    mask = cv2.inRange(hsv, lower, upper)
-    cv2.imshow("Mask", mask)
+            # Maschera giallo
+            lower_yellow = np.array([10, 40, 40], dtype=np.uint8)
+            upper_yellow = np.array([50, 255, 255], dtype=np.uint8)
+            yellow_mask = cv2.inRange(hls, lower_yellow, upper_yellow)
 
-    # Calcolo istogramma
-    histogram = np.sum(mask[mask.shape[0] // 2:, :], axis=0)
-    midpoint = int(histogram.shape[0] / 2)
-    left_base = np.argmax(histogram[:midpoint])
-    right_base = np.argmax(histogram[midpoint:]) + midpoint
+            combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
+            masked = cv2.bitwise_and(roi, roi, mask=combined_mask)
 
-    # Istogramma visivo
-    hist_img = np.zeros((300, 640, 3), dtype=np.uint8)
-    if histogram.max() > 0:
-        hist_norm = (histogram / histogram.max()) * 300
-    else:
-        hist_norm = histogram
-    for x, val in enumerate(hist_norm):
-        cv2.line(hist_img, (x, 300), (x, 300 - int(val)), (255, 255, 255), 1)
-    cv2.imshow("Histogram", hist_img)
+            # Binario
+            gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
 
-    # Sliding window
-    y = 472
-    lx = []
-    rx = []
-    while y > 0:
-        img_l = mask[y - 40:y, max(0, left_base - 50):min(640, left_base + 50)]
-        contours_l, _ = cv2.findContours(img_l, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours_l:
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                lx.append(left_base - 50 + cx)
-                left_base = left_base - 50 + cx
+            # Istogramma per trovare base delle linee
+            histogram = np.sum(binary[binary.shape[0]//2:, :], axis=0)
+            midpoint = int(histogram.shape[0] / 2)
+            leftx_base = np.argmax(histogram[:midpoint])
+            rightx_base = np.argmax(histogram[midpoint:]) + midpoint
 
-        img_r = mask[y - 40:y, max(0, right_base - 50):min(640, right_base + 50)]
-        contours_r, _ = cv2.findContours(img_r, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours_r:
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                rx.append(right_base - 50 + cx)
-                right_base = right_base - 50 + cx
+            # Parametri per sliding windows
+            nwindows = 9
+            window_height = int(binary.shape[0] / nwindows)
+            margin = 100
+            minpix = 50
 
-        y -= 40
+            nonzero = binary.nonzero()
+            nonzeroy = np.array(nonzero[0])
+            nonzerox = np.array(nonzero[1])
 
-    # Overlay con linee rilevate
-    line_overlay = topview.copy()
-    for x in lx:
-        cv2.circle(line_overlay, (int(x), y), 5, (0, 0, 255), -1)  # sinistra
-    for x in rx:
-        cv2.circle(line_overlay, (int(x), y), 5, (255, 0, 0), -1)  # destra
-    cv2.imshow("Detected Lines", line_overlay)
+            leftx_current = leftx_base
+            rightx_current = rightx_base
+            left_lane_inds = []
+            right_lane_inds = []
 
-    # Controllo dello sterzo
-    if lx and rx:
-        left_mean = np.mean(lx)
-        right_mean = np.mean(rx)
-        lane_center = (left_mean + right_mean) / 2
-        frame_center = 640 / 2
-        deviation = lane_center - frame_center
-        threshold = 20
+            # Scorri finestre verticali
+            for window in range(nwindows):
+                win_y_low = binary.shape[0] - (window + 1) * window_height
+                win_y_high = binary.shape[0] - window * window_height
+                win_xleft_low = leftx_current - margin
+                win_xleft_high = leftx_current + margin
+                win_xright_low = rightx_current - margin
+                win_xright_high = rightx_current + margin
 
-        if abs(deviation) < threshold:
-            px.set_dir_servo_angle(0)
-        else:
-            angle = -int((deviation / frame_center) * 30)
-            angle = max(-30, min(30, angle))
+                # Trova indici dei pixel bianchi
+                good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                                  (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+                good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                                   (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+                left_lane_inds.append(good_left_inds)
+                right_lane_inds.append(good_right_inds)
+
+                if len(good_left_inds) > minpix:
+                    leftx_current = int(np.mean(nonzerox[good_left_inds]))
+                if len(good_right_inds) > minpix:
+                    rightx_current = int(np.mean(nonzerox[good_right_inds]))
+
+            # Concatena indici
+            left_lane_inds = np.concatenate(left_lane_inds)
+            right_lane_inds = np.concatenate(right_lane_inds)
+
+            # Estrai coordinate
+            leftx = nonzerox[left_lane_inds]
+            lefty = nonzeroy[left_lane_inds]
+            rightx = nonzerox[right_lane_inds]
+            righty = nonzeroy[right_lane_inds]
+
+            # Determina rilevamento
+            left_detected = len(leftx) > minpix
+            right_detected = len(rightx) > minpix
+
+            # Calcola fit polinomial se disponibili
+            if left_detected:
+                left_fit = np.polyfit(lefty, leftx, 2)
+                last_left_fit = left_fit
+            else:
+                left_fit = last_left_fit
+
+            if right_detected:
+                right_fit = np.polyfit(righty, rightx, 2)
+                last_right_fit = right_fit
+            else:
+                right_fit = last_right_fit
+
+            # Calcola centro corsia e angolo sterzata
+            if left_fit is not None and right_fit is not None:
+                ploty = binary.shape[0] - 1
+                left_x = int(left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2])
+                right_x = int(right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2])
+                lane_center = (left_x + right_x) // 2
+                frame_center = binary.shape[1] // 2
+                offset = lane_center - frame_center
+                # Mappa offset in angolo -40..40 gradi
+                max_angle = 40
+                angle = int((offset / frame_center) * max_angle)
+                angle = max(-max_angle, min(max_angle, angle))
+            else:
+                angle = 0  # Default centro
+
+            # Imposta direzione
             px.set_dir_servo_angle(angle)
-    else:
+
+            # Decisione di movimento
+            if left_detected and right_detected:
+                px.set_motor_speed(20)
+                px.forward()
+            elif left_detected or right_detected:
+                px.set_motor_speed(5)
+                px.forward()
+            else:
+                px.stop()
+
+            # Per debug video
+            cv2.imshow("Lane Detection", roi)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("Interrotto manualmente")
+
+    finally:
         px.stop()
-        print("Linee non trovate, fermo.")
+        picam2.stop()
+        cv2.destroyAllWindows()
 
-    # Mostra immagini
-    cv2.imshow("Original", frame)
-    cv2.imshow("Top View", topview)
 
-    # Esci con ESC
-    if cv2.waitKey(delay) == 27:
-        break
-
-# Pulizia finale
-picam2.close()
-cv2.destroyAllWindows()
-px.stop()
+if __name__ == "__main__":
+    lane_detection_control()
