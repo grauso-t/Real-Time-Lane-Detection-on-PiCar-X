@@ -23,7 +23,8 @@ print("Picamera2 avviata, inizio acquisizione...")
 # Parametri
 fps = 24
 frame_time = int(1000 / fps)
-width, height = picam2.stream_configuration["main"]["size"]
+width = 480
+height = 640
 roi_w = width
 roi_h = height // 4
 x0, y0 = 0, height - roi_h
