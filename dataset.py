@@ -1,4 +1,3 @@
-import keyboard
 import time
 import os
 import csv
@@ -17,10 +16,9 @@ camera.configure(camera.create_still_configuration())
 camera.start()
 
 # Variabili
-angle_x = 0  # angolo attuale impostato
+angle_x = 0
 capture_dir = "./images"
 csv_file = "image_data.csv"
-
 px.set_dir_servo_angle(0)
 
 # Crea cartella immagini se non esiste
@@ -34,19 +32,19 @@ if not os.path.exists(csv_file):
 
 # Mappa dei tasti e angoli
 positions = {
-    '1': -45,
-    '2': -30,
-    '3': -15,
-    '4': 0,
-    '5': 15,
-    '6': 30,
-    '7': 45,
+    ord('1'): -45,
+    ord('2'): -30,
+    ord('3'): -15,
+    ord('4'): 0,
+    ord('5'): 15,
+    ord('6'): 30,
+    ord('7'): 45,
 }
 
-def set_position(key):
+def set_position(key_code):
     global angle_x
-    angle_x = positions[key]
-    px.set_servo_angle(angle_x)
+    angle_x = positions[key_code]
+    px.set_dir_servo_angle(angle_x)
     print(f"Angolo X impostato a {angle_x}°")
 
 def move_forward():
@@ -59,7 +57,7 @@ def stop():
 
 def capture_images():
     while True:
-        for i in range(5):  # 5 immagini al secondo
+        for _ in range(5):  # 5 immagini al secondo
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"{timestamp}.jpg"
             filepath = os.path.join(capture_dir, filename)
@@ -72,33 +70,40 @@ def capture_images():
                 writer = csv.writer(f)
                 writer.writerow([timestamp, filename, angle_x])
 
-            time.sleep(0.2)  # 5 Hz
+            time.sleep(0.2)
         time.sleep(0.01)
 
 # Avvia thread cattura immagini
 capture_thread = Thread(target=capture_images, daemon=True)
 capture_thread.start()
 
-# Info comandi
 print("Controlli:")
 print("1-7 = angolo X (-45 a +45)")
 print("8 = avanti a velocità 5")
 print("9 = stop")
+print("q = esci")
 
-# Loop principale
+# Finestra OpenCV per abilitare waitKey
+cv2.namedWindow("Controller")
+
+# Loop principale con OpenCV
 try:
     while True:
-        event = keyboard.read_event()
-        if event.event_type == keyboard.KEY_DOWN:
-            key = event.name
-            if key in positions:
-                set_position(key)
-            elif key == '8':
-                move_forward()
-            elif key == '9':
-                stop()
-        time.sleep(0.05)
+        key = cv2.waitKey(1) & 0xFF  # aspetta input per 1ms
+
+        if key in positions:
+            set_position(key)
+        elif key == ord('8'):
+            move_forward()
+        elif key == ord('9'):
+            stop()
+        elif key == ord('q'):
+            print("Uscita...")
+            break
 
 except KeyboardInterrupt:
-    px.stop()
-    print("\nUscita manuale e stop")
+    print("Interruzione manuale")
+
+finally:
+    stop()
+    cv2.destroyAllWindows()
