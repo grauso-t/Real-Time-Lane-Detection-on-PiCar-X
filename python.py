@@ -95,7 +95,7 @@ try:
         deviation   = center_line - (roi_w // 2)
 
         # PID semplice: proporzionale
-        k = 0.1  # coefficiente di guadagno (aumenta per sterzate più aggressive)
+        k = 0.1  # coefficiente di guadagno (aumenta per sterzate piÃ¹ aggressive)
         angle = int(np.clip(k * deviation, -40, 40))
         px.set_dir_servo_angle(angle)
 
@@ -122,7 +122,7 @@ try:
         out[y0:y0+roi_h, x0:x0+roi_w] = cv2.addWeighted(roi_area, 0.8, back, 1, 0)
 
         cv2.imshow('Frame con Lanes', out)
-        cv2.imshow('Bird’s-eye', bird)
+        cv2.imshow('Birdâ€™s-eye', bird)
         cv2.imshow('Edges', edges)
 
         if cv2.waitKey(frame_time) & 0xFF == ord('q'):
