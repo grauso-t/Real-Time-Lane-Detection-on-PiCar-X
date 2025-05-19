@@ -9,7 +9,7 @@ px = Picarx()
 px.set_dir_servo_angle(0)
 px.forward(10)
 
-# Configura e avvia Picamera2
+        # Configura e avvia Picamera2
 picam2 = Picamera2()
 preview_config = picam2.create_preview_configuration(
     main={"size": (640, 480)},
@@ -23,8 +23,8 @@ print("Picamera2 avviata, inizio acquisizione...")
 # Parametri
 fps = 24
 frame_time = int(1000 / fps)
-width = 480
-height = 640
+width = 640  # Corretto in base alla configurazione della camera
+height = 480  # Corretto in base alla configurazione della camera
 roi_w = width
 roi_h = height // 4
 x0, y0 = 0, height - roi_h
@@ -47,18 +47,54 @@ def avg_line(segs):
 try:
     while True:
         frame = picam2.capture_array()
+        
+        # Verifica dimensioni del frame
+        actual_height, actual_width = frame.shape[:2]
+        if actual_height != height or actual_width != width:
+            print(f"ATTENZIONE: Dimensioni frame ({actual_width}x{actual_height}) diverse da quelle attese ({width}x{height})")
+            height, width = actual_height, actual_width
+        
+        roi_h = height // 4
+        roi_w = width
+        x0, y0 = 0, height - roi_h
+        
+        # Controllo dimensioni ROI
+        if y0 < 0 or y0 + roi_h > height or x0 < 0 or x0 + roi_w > width:
+            print("ERRORE: ROI fuori dai limiti del frame!")
+            y0 = max(0, min(height - roi_h, y0))
+            x0 = max(0, min(width - roi_w, x0))
+            
         roi = frame[y0:y0 + roi_h, x0:x0 + roi_w]
 
         # Adatta in base alla tua camera
         src_pts = np.float32([
             [0, roi_h],
             [roi_w, roi_h],
-            [roi_w, 20],
-            [20, 0]
+            [roi_w * 0.65, roi_h * 0.35],  # Valore più sicuro per la trasformazione
+            [roi_w * 0.35, roi_h * 0.35]   # Valore più sicuro per la trasformazione
         ])
-        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
-        bird = cv2.warpPerspective(roi, M, (roi_w, roi_h))
+        
+        dst_pts = np.float32([
+            [0, roi_h],
+            [roi_w, roi_h],
+            [roi_w, 0],
+            [0, 0]
+        ])
+        
+        # Assicurati che le matrici siano nel formato corretto
+        src_pts = src_pts.astype(np.float32)
+        dst_pts = dst_pts.astype(np.float32)
+        
+        try:
+            M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
+            bird = cv2.warpPerspective(roi, M, (roi_w, roi_h))
+        except Exception as e:
+            print(f"Errore nella trasformazione prospettica: {e}")
+            print(f"Dimensioni ROI: {roi.shape}")
+            print(f"src_pts: {src_pts}")
+            print(f"dst_pts: {dst_pts}")
+            continue  # Salta questo frame
 
         # Maschere colore
         hls = cv2.cvtColor(bird, cv2.COLOR_BGR2HLS)
@@ -155,14 +191,18 @@ try:
         cv2.putText(bird_vis, f"Larghezza: {lane_width:.1f}px", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
         cv2.putText(bird_vis, f"Angolo: {angle}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-        back = cv2.warpPerspective(bird_vis, Minv, (roi_w, roi_h))
-        out = frame.copy()
-        roi_area = out[y0:y0+roi_h, x0:x0+roi_w]
-        out[y0:y0+roi_h, x0:x0+roi_w] = cv2.addWeighted(roi_area, 0.8, back, 1, 0)
+        try:
+            back = cv2.warpPerspective(bird_vis, Minv, (roi_w, roi_h))
+            out = frame.copy()
+            roi_area = out[y0:y0+roi_h, x0:x0+roi_w]
+            out[y0:y0+roi_h, x0:x0+roi_w] = cv2.addWeighted(roi_area, 0.8, back, 1, 0)
 
-        cv2.imshow('Frame con Lanes', out)
-        cv2.imshow('Bird\'s-eye', bird_vis)
-        cv2.imshow('Edges', edges)
+            cv2.imshow('Frame con Lanes', out)
+            cv2.imshow('Bird\'s-eye', bird_vis)
+            cv2.imshow('Edges', edges)
+        except Exception as e:
+            print(f"Errore nella visualizzazione: {e}")
+            continue  # Salta la visualizzazione per questo frame
 
         if cv2.waitKey(frame_time) & 0xFF == ord('q'):
             break
