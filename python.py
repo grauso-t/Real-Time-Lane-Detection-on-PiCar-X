@@ -7,12 +7,10 @@ import time
 # Inizializza Picarx
 px = Picarx()
 px.set_dir_servo_angle(0)
-# Imposta la velocità a 5 invece di 10
 px.forward(5)
 
 # Configura e avvia Picamera2
 picam2 = Picamera2()
-# Conferma risoluzione 640x480
 preview_config = picam2.create_preview_configuration(
     main={"size": (640, 480)},
     lores={"size": (320, 240)},
@@ -25,7 +23,8 @@ print("Picamera2 avviata, inizio acquisizione...")
 # Parametri
 fps = 24
 frame_time = int(1000 / fps)
-width, height = 640, 480
+width = 640
+height = 480
 roi_w = width
 roi_h = 200
 x0, y0 = 0, height - roi_h
@@ -45,20 +44,17 @@ def avg_line(segs):
     m, q = np.polyfit(ys, xs, 1)
     return (int(m*roi_h + q), roi_h, int(q), 0)
 
-# Inizializza la variabile per memorizzare l'angolo precedente
-prev_angle = 0
-
 try:
     while True:
         frame = picam2.capture_array()
         roi = frame[y0:y0 + roi_h, x0:x0 + roi_w]
 
-        # Migliora la trasformazione prospettica per una visione bird's-eye più precisa
+        # Adatta in base alla tua camera
         src_pts = np.float32([
             [0, roi_h],
             [roi_w, roi_h],
-            [roi_w*0.65, 0],
-            [roi_w*0.35, 0]
+            [roi_w, 20],
+            [20, 0]
         ])
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
         Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
@@ -100,23 +96,8 @@ try:
         deviation   = center_line - (roi_w // 2)
 
         # PID semplice: proporzionale
-        k = 0.1  # coefficiente di guadagno (aumenta per sterzate più aggressive)
-        
-        # Verifica se le linee si incrociano
-        lines_crossed = False
-        
-        # Controlla se le linee si incrociano verificando le posizioni relative
-        if (left_avg[0] > right_avg[0]) or (left_avg[2] > right_avg[2]):
-            lines_crossed = True
-            # Mantieni l'angolo precedente quando le linee si incrociano
-            angle = prev_angle
-            print("Linee incrociate: mantengo angolo precedente", angle)
-        else:
-            # Calcola nuovo angolo se le linee non si incrociano
-            angle = int(np.clip(k * deviation, -40, 40))
-            prev_angle = angle
-        
-        # Applica l'angolo calcolato
+        k = 0.8  # coefficiente di guadagno (aumenta per sterzate piÃ¹ aggressive)
+        angle = int(np.clip(k * deviation, -40, 40))
         px.set_dir_servo_angle(angle)
 
         # Visualizzazione
@@ -135,11 +116,6 @@ try:
         fill = np.zeros_like(bird)
         cv2.fillPoly(fill, [pts], (0,255,255))
         bird_vis = cv2.addWeighted(overlay, 1, fill, 0.3, 0)
-        
-        # Aggiungi testo per lo stato delle linee
-        status_text = "Normale" if not lines_crossed else "Linee incrociate"
-        cv2.putText(bird_vis, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(bird_vis, f"Angle: {angle}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         back = cv2.warpPerspective(bird_vis, Minv, (roi_w, roi_h))
         out = frame.copy()
@@ -147,7 +123,7 @@ try:
         out[y0:y0+roi_h, x0:x0+roi_w] = cv2.addWeighted(roi_area, 0.8, back, 1, 0)
 
         cv2.imshow('Frame con Lanes', out)
-        cv2.imshow('Bird\'s-eye', bird)
+        cv2.imshow('Birdâ€™s-eye', bird)
         cv2.imshow('Edges', edges)
 
         if cv2.waitKey(frame_time) & 0xFF == ord('q'):
