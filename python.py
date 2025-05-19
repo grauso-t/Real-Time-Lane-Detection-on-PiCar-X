@@ -82,7 +82,14 @@ try:
                 x1,y1,x2,y2 = l[0]
                 if x2==x1: continue
                 slope = (y2-y1)/(x2-x1)
+                
+                # Ignora linee con pendenza troppo piccola (orizzontali)
                 if abs(slope)<0.3: continue
+                
+                # Ignora segmenti troppo corti
+                length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+                if length < 25: continue  # Aumentato soglia minima lunghezza
+                
                 if slope < 0:
                     left_segs.append((x1,y1,x2,y2))
                 else:
@@ -91,13 +98,34 @@ try:
         left_avg  = avg_line(left_segs)  or (0,roi_h,0,0)
         right_avg = avg_line(right_segs) or (roi_w-1,roi_h,roi_w-1,0)
 
-        # Deviazione dal centro
-        center_line = (left_avg[0] + right_avg[0]) // 2
-        deviation   = center_line - (roi_w // 2)
-
-        # PID semplice: proporzionale
-        k = 0.1  # coefficiente di guadagno (aumenta per sterzate più aggressive)
-        angle = int(np.clip(k * deviation, -40, 40))
+        # Calcola la larghezza della carreggiata
+        lane_width = right_avg[0] - left_avg[0]  # Larghezza in basso
+        lane_width_top = right_avg[2] - left_avg[2]  # Larghezza in alto
+        
+        # Controlla che la carreggiata non sia troppo stretta
+        min_lane_width = roi_w * 0.3  # La carreggiata deve essere almeno il 30% della larghezza totale
+        
+        valid_lane = lane_width > min_lane_width and lane_width_top > min_lane_width * 0.5
+        
+        # Variabile per mantenere l'angolo precedente (definita fuori dal loop)
+        try:
+            previous_angle
+        except NameError:
+            previous_angle = 0
+        
+        # Deviazione dal centro solo se la carreggiata è valida
+        if valid_lane:
+            center_line = (left_avg[0] + right_avg[0]) // 2
+            deviation = center_line - (roi_w // 2)
+            
+            # PID semplice: proporzionale
+            k = 0.4  # coefficiente di guadagno (aumenta per sterzate più aggressive)
+            angle = int(np.clip(k * deviation, -40, 40))
+            previous_angle = angle  # Memorizza l'angolo valido per il prossimo frame
+        else:
+            # Se la carreggiata non è valida, mantieni la direzione precedente
+            angle = previous_angle
+            
         px.set_dir_servo_angle(angle)
 
         # Visualizzazione
@@ -114,8 +142,18 @@ try:
                         [right_avg[2],right_avg[3]],
                         [right_avg[0],right_avg[1]]], np.int32)
         fill = np.zeros_like(bird)
-        cv2.fillPoly(fill, [pts], (0,255,255))
+        
+        # Colora la carreggiata in base alla validità
+        fill_color = (0,255,255) if valid_lane else (0,0,255)  # Giallo se valida, rosso se troppo stretta
+        cv2.fillPoly(fill, [pts], fill_color)
+        
         bird_vis = cv2.addWeighted(overlay, 1, fill, 0.3, 0)
+
+        # Aggiungi indicatore di stato
+        status_text = "Carreggiata: Valida" if valid_lane else "Carreggiata: Invalida (uso angolo precedente)"
+        cv2.putText(bird_vis, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        cv2.putText(bird_vis, f"Larghezza: {lane_width:.1f}px", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        cv2.putText(bird_vis, f"Angolo: {angle}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
         back = cv2.warpPerspective(bird_vis, Minv, (roi_w, roi_h))
         out = frame.copy()
@@ -123,7 +161,7 @@ try:
         out[y0:y0+roi_h, x0:x0+roi_w] = cv2.addWeighted(roi_area, 0.8, back, 1, 0)
 
         cv2.imshow('Frame con Lanes', out)
-        cv2.imshow('Bird’s-eye', bird)
+        cv2.imshow('Bird\'s-eye', bird_vis)
         cv2.imshow('Edges', edges)
 
         if cv2.waitKey(frame_time) & 0xFF == ord('q'):
