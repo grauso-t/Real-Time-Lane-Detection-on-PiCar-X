@@ -92,13 +92,22 @@ while True:
 
     # Calcolo centro corsia e sterzata
     frame_center = 320
+
     if left_x and right_x:
         lane_center = (int(np.mean(left_x)) + int(np.mean(right_x))) // 2
         error = lane_center - frame_center
-        angle = -int(error / 3)
-        last_direction = angle
-        picarx.forward(20)
-        picarx.set_dir_servo_angle(angle)
+        tolerance = 15  # Tolleranza in pixel (puoi aumentare fino a 25 se serve)
+
+        if abs(error) < tolerance:
+            # Se l'errore è piccolo, mantieni direzione attuale
+            picarx.forward(20)
+            picarx.set_dir_servo_angle(last_direction)
+        else:
+            # Altrimenti correggi
+            angle = -int(error / 3)
+            last_direction = angle
+            picarx.forward(20)
+            picarx.set_dir_servo_angle(angle)
 
     elif left_x and not right_x:
         lane_center = int(np.mean(left_x)) + 100
