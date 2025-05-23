@@ -100,13 +100,19 @@ while True:
 
     # Calcolo centro corsia
     frame_center = 320
+    offset = 150
+
     if left_x and right_x:
-        lane_center = (int(np.mean(left_x)) + int(np.mean(right_x))) // 2
+        # Priorità alla linea sinistra: 150 px a destra di essa
+        lane_center = int(np.mean(left_x)) + offset
     elif left_x:
-        lane_center = int(np.mean(left_x)) + 100
+        # Solo sinistra: 150 px a destra
+        lane_center = int(np.mean(left_x)) + offset
     elif right_x:
-        lane_center = int(np.mean(right_x)) - 100
+        # Solo destra: 150 px a sinistra
+        lane_center = int(np.mean(right_x)) - offset
     else:
+        # Nessuna linea visibile
         lane_center = frame_center
 
     error = lane_center - frame_center
@@ -116,7 +122,7 @@ while True:
     print(f"Lane center: {lane_center}, Error: {error}, Angle: {angle}")
 
     if running:
-        picarx.forward(20)
+        picarx.forward(1)
         picarx.set_dir_servo_angle(angle)
     else:
         picarx.stop()
