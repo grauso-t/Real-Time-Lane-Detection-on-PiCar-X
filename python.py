@@ -9,12 +9,10 @@ px = Picarx()
 px.forward(0)  # Start with zero speed
 
 # Constants for PiCar control
-FORWARD_SPEED = 0       # Forward speed (constant)
+FORWARD_SPEED = 1       # Forward speed (constant)
 MAX_STEERING_ANGLE = 45  # Maximum steering angle
-CENTER_OFFSET = 75 # Reduced for faster response
-STEERING_AGGRESSION = 4  # Amplification factor for steeper turns
-MIN_LANE_WIDTH = 100    # Minimum distance from center to consider valid lane line
-MIN_TOTAL_LANE_WIDTH = 180  # Minimum total lane width to update steering
+STEERING_SMOOTHING = 0.7  # Smoothing factor for steering (0-1, higher = more smoothing)
+MIN_LANE_WIDTH = 180    # Minimum lane width to accept steering changes
 
 # Initialize PiCamera2
 picam2 = Picamera2()
@@ -35,7 +33,7 @@ def average_line(lines, side, width, height):
     """
     if len(lines) == 0:
         x_pos = 20 if side == 'left' else width - 20
-        y1, y2 = height, int(height * 0.2)  # from bottom to 20% height
+        y1, y2 = height, int(height * 0.6)  # from bottom to 60% height
         return (x_pos, y1, x_pos, y2)
    
     x_coords = []
@@ -49,104 +47,122 @@ def average_line(lines, side, width, height):
     x2 = int(poly[0] * y2 + poly[1])
     return (x1, y1, x2, y2)
 
-def calculate_steering_angle(left_x, right_x, frame_width):
+def calculate_lane_width(left_line, right_line, left_detected, right_detected, frame_width):
     """
-    Calculate the steering angle based on lane position.
-    Adjusted for steeper turns with non-linear response.
+    Calculate lane width at the bottom of the frame.
+    If only one line is detected, estimate the width based on typical lane dimensions.
     """
-    lane_center = (left_x + right_x) // 2
-    center_offset = lane_center - (frame_width // 2)
+    if left_detected and right_detected:
+        # Both lines detected - calculate actual width
+        lx1, ly1, lx2, ly2 = left_line
+        rx1, ry1, rx2, ry2 = right_line
+        width = abs(rx1 - lx1)  # Width at bottom
+        return width, "actual"
     
-    max_offset = frame_width // 4  # Reduced for more sensitivity
-    normalized_offset = center_offset / max_offset
+    elif left_detected and not right_detected:
+        # Only left line - estimate right boundary
+        lx1, ly1, lx2, ly2 = left_line
+        estimated_right_x = lx1 + 150  # Typical lane width estimate
+        # Clamp to frame boundaries
+        estimated_right_x = min(estimated_right_x, frame_width - 10)
+        width = abs(estimated_right_x - lx1)
+        return width, "estimated_from_left"
     
-    if normalized_offset != 0:
-        sign = np.sign(normalized_offset)
-        nonlinear_response = sign * (abs(normalized_offset) ** 0.8) * STEERING_AGGRESSION
-        if abs(nonlinear_response) > 1:
-            nonlinear_response = sign * 1.0
+    elif not left_detected and right_detected:
+        # Only right line - estimate left boundary
+        rx1, ry1, rx2, ry2 = right_line
+        estimated_left_x = rx1 - 150  # Typical lane width estimate
+        # Clamp to frame boundaries
+        estimated_left_x = max(estimated_left_x, 10)
+        width = abs(rx1 - estimated_left_x)
+        return width, "estimated_from_right"
+    
     else:
-        nonlinear_response = 0
-    
-    steering_angle = nonlinear_response * MAX_STEERING_ANGLE
-    return max(min(steering_angle, MAX_STEERING_ANGLE), -MAX_STEERING_ANGLE)
+        # No lines detected
+        return 0, "no_detection"
 
-def draw_lane_width_visualization(img, left_x, right_x, lane_width, y_pos, is_valid_width):
+def calculate_lane_direction_angle(left_line, right_line, left_lines_detected, right_lines_detected, frame_width, frame_height):
     """
-    Draw lane width visualization with color coding
+    Calculate the steering angle based on the direction of the lane.
+    Now uses the actual angle of the lane direction for more accurate steering.
     """
-    # Determine color based on lane width and validity
-    if not is_valid_width:
-        color = (0, 0, 255)  # Red for invalid/narrow lane
-        status = "INVALID"
-    else:
-        color = (0, 255, 0)  # Green for acceptable lane width
-        status = "VALID"
+    lx1, ly1, lx2, ly2 = left_line if left_line else (0, 0, 0, 0)
+    rx1, ry1, rx2, ry2 = right_line if right_line else (0, 0, 0, 0)
     
-    # Draw horizontal line showing lane width
-    cv2.line(img, (left_x, y_pos), (right_x, y_pos), color, 3)
-    
-    # Draw vertical markers at lane edges
-    cv2.line(img, (left_x, y_pos - 10), (left_x, y_pos + 10), color, 2)
-    cv2.line(img, (right_x, y_pos - 10), (right_x, y_pos + 10), color, 2)
-    
-    # Draw lane width text
-    mid_x = (left_x + right_x) // 2
-    cv2.putText(img, f"{lane_width:.0f}px [{status}]", 
-                (mid_x - 50, y_pos - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    
-    return status
-
-def draw_steering_angle_visualization(img, steering_angle, center_x, center_y, is_angle_updated):
-    """
-    Draw steering angle visualization with arrow and arc
-    """
-    # Calculate arrow endpoint based on steering angle
-    angle_rad = np.deg2rad(-steering_angle)  # Negative for correct direction
-    arrow_length = 60
-    end_x = int(center_x + arrow_length * np.sin(angle_rad))
-    end_y = int(center_y - arrow_length * np.cos(angle_rad))
-    
-    # Determine color based on whether angle was updated
-    if is_angle_updated:
-        # Color based on steering intensity
-        abs_angle = abs(steering_angle)
-        if abs_angle < 10:
-            color = (0, 255, 0)  # Green for small angles
-        elif abs_angle < 25:
-            color = (0, 255, 255)  # Yellow for medium angles
-        else:
-            color = (0, 0, 255)  # Red for large angles
-    else:
-        color = (128, 128, 128)  # Gray for maintained previous angle
-    
-    # Draw center point
-    cv2.circle(img, (center_x, center_y), 5, (255, 255, 255), -1)
-    
-    # Draw steering direction arrow
-    cv2.arrowedLine(img, (center_x, center_y), (end_x, end_y), color, 3, tipLength=0.3)
-    
-    # Draw arc showing angle range
-    if abs(steering_angle) > 2:  # Only draw arc for significant angles
-        start_angle = -90 - abs(steering_angle) if steering_angle > 0 else -90
-        end_angle = -90 + abs(steering_angle) if steering_angle > 0 else -90 + abs(steering_angle)
+    # Case 1: Both lines detected - use lane center direction and its angle
+    if left_lines_detected and right_lines_detected:
+        # Calculate center points
+        center_bottom_x = (lx1 + rx1) / 2
+        center_top_x = (lx2 + rx2) / 2
         
-        cv2.ellipse(img, (center_x, center_y), (40, 40), 0, 
-                   start_angle, end_angle, color, 2)
+        # Calculate the angle of the center line relative to vertical
+        dx = center_top_x - center_bottom_x
+        dy = ly1 - ly2  # Note: y increases downward in image coordinates
+        
+        # Calculate angle in degrees (0 = straight, positive = right turn, negative = left turn)
+        lane_angle_rad = np.arctan2(dx, dy)
+        lane_angle_deg = np.degrees(lane_angle_rad)
+        
+        # Apply proportional steering based on the lane angle
+        steering_angle = lane_angle_deg * 1.2  # Amplify response
+        
+        return np.clip(steering_angle, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE), lane_angle_deg, "both_lines"
+    
+    # Case 2: Only left line detected - use left line angle as reference
+    elif left_lines_detected and not right_lines_detected:
+        dx = lx2 - lx1
+        dy = ly1 - ly2
+        left_angle_rad = np.arctan2(dx, dy)
+        left_angle_deg = np.degrees(left_angle_rad)
+        
+        # For single line, we need to interpret the line angle differently
+        # If the left line is angled right (positive), we should turn left to center
+        steering_angle = -left_angle_deg * 0.8  # Invert and reduce sensitivity
+        
+        return np.clip(steering_angle, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE), left_angle_deg, "left_only"
+    
+    # Case 3: Only right line detected - use right line angle as reference
+    elif not left_lines_detected and right_lines_detected:
+        dx = rx2 - rx1
+        dy = ry1 - ry2
+        right_angle_rad = np.arctan2(dx, dy)
+        right_angle_deg = np.degrees(right_angle_rad)
+        
+        # For single line, if the right line is angled left (negative), we should turn right to center
+        steering_angle = -right_angle_deg * 0.8  # Invert and reduce sensitivity
+        
+        return np.clip(steering_angle, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE), right_angle_deg, "right_only"
+    
+    # Case 4: No lines detected
+    else:
+        return 0, 0, "no_lines"
 
-def filter_lines_by_distance_from_center(lines, frame_center, min_distance):
+def smooth_steering(current_angle, previous_angle, smoothing_factor):
     """
-    Filter out lines that are too close to the center of the frame
+    Apply smoothing to steering angle to reduce jittery movements.
     """
-    filtered_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]  # Extract coordinates from nested array
-        # Calculate average x position of the line
-        avg_x = (x1 + x2) / 2
-        # Check if line is far enough from center
-        if abs(avg_x - frame_center) > min_distance:
-            filtered_lines.append(line)
-    return filtered_lines
+    return smoothing_factor * previous_angle + (1 - smoothing_factor) * current_angle
+
+def draw_angle_visualization(image, center_x, center_y, angle_deg, length=80):
+    """
+    Draw a line showing the detected angle for steering calculation.
+    """
+    # Convert angle to radians for calculation
+    angle_rad = np.radians(angle_deg)
+    
+    # Calculate end point of the angle line
+    end_x = int(center_x + length * np.sin(angle_rad))
+    end_y = int(center_y - length * np.cos(angle_rad))  # Negative because y increases downward
+    
+    # Draw the angle line
+    cv2.line(image, (center_x, center_y), (end_x, end_y), (255, 0, 255), 3)  # Magenta line
+    
+    # Draw a small circle at the center
+    cv2.circle(image, (center_x, center_y), 5, (255, 0, 255), -1)
+    
+    # Add angle text
+    cv2.putText(image, f"Angle: {angle_deg:.1f}°", 
+               (center_x + 10, center_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
 try:
     px.forward(FORWARD_SPEED)
@@ -204,107 +220,144 @@ try:
         right_lines = []
         
         if lines is not None:
-            # Filter lines that are too close to center
-            frame_center = dst_width // 2
-            filtered_lines = filter_lines_by_distance_from_center(lines, frame_center, MIN_LANE_WIDTH)
-            
-            for line in filtered_lines:
+            for line in lines:
                 x1, y1, x2, y2 = line[0]
                 slope = (y2 - y1) / (x2 - x1 + 1e-6)
                 
                 if abs(slope) < 0.6:
                     continue
-                
-                # Check which side of center the line is on
-                avg_x = (x1 + x2) / 2
-                if avg_x < frame_center and slope < 0:
+                    
+                if slope < 0:
                     left_lines.append((x1, y1, x2, y2))
-                elif avg_x > frame_center and slope > 0:
+                else:
                     right_lines.append((x1, y1, x2, y2))
         
-        # Calculate average lines or use default positions if not detected
-        left_line = average_line(left_lines, 'left', dst_width, dst_height)
-        right_line = average_line(right_lines, 'right', dst_width, dst_height)
+        # Track which lines were actually detected
+        left_lines_detected = len(left_lines) > 0
+        right_lines_detected = len(right_lines) > 0
+        
+        left_line = average_line(left_lines, 'left', dst_width, dst_height) if left_lines_detected else None
+        right_line = average_line(right_lines, 'right', dst_width, dst_height) if right_lines_detected else None
         
         lane_overlay = np.zeros_like(bird_eye_view)
         
-        # Initialize variables for steering calculation
-        steering_angle = previous_steering_angle
-        is_angle_updated = False
-        
-        if left_line and right_line:
-            lx1, ly1, lx2, ly2 = left_line
-            rx1, ry1, rx2, ry2 = right_line
-            
-            # Draw lane lines
-            cv2.line(bird_eye_view, (lx1, ly1), (lx2, ly2), (255, 0, 0), 3)  # Blue for left
-            cv2.line(bird_eye_view, (rx1, ry1), (rx2, ry2), (0, 255, 255), 3)  # Cyan for right
-            
-            # Fill lane area
-            points = np.array([
-                [lx1, ly1],
-                [rx1, ry1],
-                [rx2, ry2],
-                [lx2, ly2]
-            ])
-            cv2.fillPoly(lane_overlay, [points], (0, 255, 0))
-            
-            left_bottom_x = lx1
-            right_bottom_x = rx1
-            
+        if left_line or right_line:
             # Calculate lane width
-            lane_width = abs(left_bottom_x - right_bottom_x)
+            lane_width, width_method = calculate_lane_width(
+                left_line, right_line, left_lines_detected, right_lines_detected, dst_width
+            )
             
-            # Check if lane width is acceptable and lines are not too close to center
-            left_distance_from_center = abs(left_bottom_x - dst_width // 2)
-            right_distance_from_center = abs(right_bottom_x - dst_width // 2)
+            # Calculate steering angle based on available lines
+            raw_steering_angle, detected_angle, detection_status = calculate_lane_direction_angle(
+                left_line, right_line, left_lines_detected, right_lines_detected, dst_width, dst_height
+            )
             
-            is_valid_width = (lane_width >= MIN_TOTAL_LANE_WIDTH and 
-                            left_distance_from_center >= MIN_LANE_WIDTH and 
-                            right_distance_from_center >= MIN_LANE_WIDTH)
-            
-            # Update steering angle only if conditions are met
-            if is_valid_width:
-                steering_angle = calculate_steering_angle(left_bottom_x, right_bottom_x, dst_width)
+            # Check if lane width is sufficient for steering adjustment
+            if lane_width >= MIN_LANE_WIDTH:
+                # Apply smoothing
+                steering_angle = smooth_steering(raw_steering_angle, previous_steering_angle, STEERING_SMOOTHING)
+                # Update the previous steering angle
                 previous_steering_angle = steering_angle
-                is_angle_updated = True
+                width_status = "OK"
+            else:
+                # Lane too narrow, maintain previous steering angle
+                steering_angle = previous_steering_angle
+                width_status = "TOO_NARROW"
             
-            # Set servo angle
             px.set_dir_servo_angle(steering_angle)
             
-            # Draw visualizations
-            lane_width_status = draw_lane_width_visualization(
-                bird_eye_view, left_bottom_x, right_bottom_x, lane_width, 
-                dst_height - 30, is_valid_width
-            )
+            # Draw detected lines and lane area
+            if left_lines_detected and right_lines_detected:
+                # Both lines detected - draw full lane
+                lx1, ly1, lx2, ly2 = left_line
+                rx1, ry1, rx2, ry2 = right_line
+                points = np.array([
+                    [lx1, ly1],
+                    [rx1, ry1],
+                    [rx2, ry2],
+                    [lx2, ly2]
+                ])
+                cv2.fillPoly(lane_overlay, [points], (0, 255, 0))
+                
+                # Draw center line
+                center_bottom_x = int((lx1 + rx1) / 2)
+                center_top_x = int((lx2 + rx2) / 2)
+                cv2.line(lane_overlay, (center_bottom_x, ly1), (center_top_x, ly2), (255, 0, 0), 3)
+                
+                # Draw width measurement line at bottom
+                cv2.line(lane_overlay, (lx1, ly1), (rx1, ry1), (0, 255, 255), 2)  # Cyan line for width
+                
+                # Draw angle visualization at center
+                center_y = int((ly1 + ly2) / 2)
+                draw_angle_visualization(lane_overlay, center_bottom_x, center_y, detected_angle)
+                
+            elif left_lines_detected:
+                # Only left line detected
+                lx1, ly1, lx2, ly2 = left_line
+                cv2.line(lane_overlay, (lx1, ly1), (lx2, ly2), (0, 255, 255), 4)  # Yellow line
+                
+                # Draw estimated lane area
+                estimated_right_x1 = min(lx1 + 150, dst_width - 10)
+                estimated_right_x2 = min(lx2 + 120, dst_width - 10)
+                points = np.array([
+                    [lx1, ly1],
+                    [estimated_right_x1, ly1],
+                    [estimated_right_x2, ly2],
+                    [lx2, ly2]
+                ])
+                cv2.fillPoly(lane_overlay, [points], (0, 150, 150))  # Darker green for estimated area
+                
+                # Draw width measurement line
+                cv2.line(lane_overlay, (lx1, ly1), (estimated_right_x1, ly1), (0, 255, 255), 2)
+                
+                # Draw angle visualization
+                center_x = int((lx1 + estimated_right_x1) / 2)
+                center_y = int((ly1 + ly2) / 2)
+                draw_angle_visualization(lane_overlay, center_x, center_y, detected_angle)
+                
+            elif right_lines_detected:
+                # Only right line detected
+                rx1, ry1, rx2, ry2 = right_line
+                cv2.line(lane_overlay, (rx1, ry1), (rx2, ry2), (0, 255, 255), 4)  # Yellow line
+                
+                # Draw estimated lane area
+                estimated_left_x1 = max(rx1 - 150, 10)
+                estimated_left_x2 = max(rx2 - 120, 10)
+                points = np.array([
+                    [estimated_left_x1, ry1],
+                    [rx1, ry1],
+                    [rx2, ry2],
+                    [estimated_left_x2, ry2]
+                ])
+                cv2.fillPoly(lane_overlay, [points], (0, 150, 150))  # Darker green for estimated area
+                
+                # Draw width measurement line
+                cv2.line(lane_overlay, (estimated_left_x1, ry1), (rx1, ry1), (0, 255, 255), 2)
+                
+                # Draw angle visualization
+                center_x = int((estimated_left_x1 + rx1) / 2)
+                center_y = int((ry1 + ry2) / 2)
+                draw_angle_visualization(lane_overlay, center_x, center_y, detected_angle)
             
-            draw_steering_angle_visualization(
-                bird_eye_view, steering_angle, dst_width // 2, dst_height - 60, is_angle_updated
-            )
+            # Display information
+            cv2.putText(frame_overlay, f"Steering: {steering_angle:.1f}° ({width_status})", 
+                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
-            # Display information on main frame
-            status_text = "UPDATED" if is_angle_updated else "MAINTAINED"
-            color = (0, 255, 0) if is_angle_updated else (0, 165, 255)
+            cv2.putText(frame_overlay, f"Lane Width: {lane_width:.0f}px ({width_method})", 
+                      (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
-            cv2.putText(frame_overlay, f"Steering: {steering_angle:.1f}° [{status_text}]", 
-                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-            cv2.putText(frame_overlay, f"Lane Width: {lane_width:.0f}px [{lane_width_status}]", 
-                      (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-            cv2.putText(frame_overlay, f"Aggression: {STEERING_AGGRESSION:.1f}x", 
+            cv2.putText(frame_overlay, f"Detected Angle: {detected_angle:.1f}°", 
                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
-            bird_eye_lane = cv2.addWeighted(bird_eye_view, 1.0, lane_overlay, 0.3, 0)
+            cv2.putText(frame_overlay, f"Detection: {detection_status}", 
+                      (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            bird_eye_lane = cv2.addWeighted(bird_eye_view, 1.0, lane_overlay, 0.5, 0)
         else:
-            # No lanes detected - maintain previous angle
-            px.set_dir_servo_angle(steering_angle)
-            cv2.putText(frame_overlay, f"No lanes - Maintaining: {steering_angle:.1f}°", 
+            px.set_dir_servo_angle(0)
+            cv2.putText(frame_overlay, "Lane not detected - Centered steering", 
                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             bird_eye_lane = bird_eye_view.copy()
-        
-        # Draw center line for reference
-        cv2.line(bird_eye_lane, (dst_width // 2, 0), (dst_width // 2, dst_height), (255, 255, 255), 1)
         
         cv2.imshow("Carreggiata Rilevata", bird_eye_lane)
         cv2.imshow("Camera View", frame_overlay)
@@ -318,9 +371,11 @@ try:
             time.sleep(30)
             px.forward(FORWARD_SPEED)
         elif key == ord('+'): 
-            STEERING_AGGRESSION = min(STEERING_AGGRESSION + 0.1, 3.0)
+            STEERING_SMOOTHING = min(STEERING_SMOOTHING + 0.05, 0.95)
+            print(f"Smoothing: {STEERING_SMOOTHING:.2f}")
         elif key == ord('-'):
-            STEERING_AGGRESSION = max(STEERING_AGGRESSION - 0.1, 1.0)
+            STEERING_SMOOTHING = max(STEERING_SMOOTHING - 0.05, 0.05)
+            print(f"Smoothing: {STEERING_SMOOTHING:.2f}")
 
 except KeyboardInterrupt:
     print("Program interrupted by user")
