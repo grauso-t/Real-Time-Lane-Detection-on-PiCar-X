@@ -4,6 +4,7 @@ from picarx import Picarx
 from picamera2 import Picamera2
 import time
 
+# Inizializza la macchina e la fotocamera
 picarx = Picarx()
 picam2 = Picamera2()
 picam2.preview_configuration.main.size = (640, 480)
@@ -11,6 +12,10 @@ picam2.preview_configuration.main.format = "BGR888"
 picam2.configure("preview")
 picam2.start()
 time.sleep(2)
+
+# Video writer per salvare il video con annotazioni
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+out = cv2.VideoWriter('lane_debug.avi', fourcc, 20.0, (640, 480))
 
 # Trackbar per calibrazione
 def nothing(x):
@@ -24,29 +29,23 @@ cv2.createTrackbar("U - H", "Trackbars", 255, 255, nothing)
 cv2.createTrackbar("U - S", "Trackbars", 50, 255, nothing)
 cv2.createTrackbar("U - V", "Trackbars", 255, 255, nothing)
 
-# Per salvataggio video
-fourcc = cv2.VideoWriter_fourcc(*'XVID')
-out = cv2.VideoWriter('output.avi', fourcc, 20.0, (640, 480))
-
 last_direction = 0
-running = True  # Stato del movimento
+last_valid_lane_center = 320
+running = True
 
 while True:
     frame = picam2.capture_array()
     frame = cv2.resize(frame, (640, 480))
-    debug_frame = frame.copy()
 
-    # ROI
+    # ROI per trasformazione prospettica
     tl = (70, 220)
     bl = (0, 472)
     tr = (570, 220)
     br = (640, 472)
-
     pts1 = np.float32([tl, bl, tr, br])
     pts2 = np.float32([[0, 0], [0, 480], [640, 0], [640, 480]])
     matrix = cv2.getPerspectiveTransform(pts1, pts2)
     transformed_frame = cv2.warpPerspective(frame, matrix, (640, 480))
-    debug_warp = transformed_frame.copy()
 
     # Soglia HSV
     hsv = cv2.cvtColor(transformed_frame, cv2.COLOR_BGR2HSV)
@@ -60,23 +59,29 @@ while True:
     upper = np.array([u_h, u_s, u_v])
     mask = cv2.inRange(hsv, lower, upper)
 
-    # Sliding windows
-    histogram = np.sum(mask[mask.shape[0]//2:, :], axis=0)
-    midpoint = histogram.shape[0] // 2
+    # Istogramma
+    histogram = np.sum(mask[mask.shape[0] // 2:, :], axis=0)
+    midpoint = int(histogram.shape[0] / 2)
     left_base = np.argmax(histogram[:midpoint])
     right_base = np.argmax(histogram[midpoint:]) + midpoint
 
+    # Sliding windows
     y = 472
     window_height = 40
     left_x, right_x = [], []
+    valid_frame = True
 
     while y > 0:
-        top_y = y - window_height
-        bottom_y = y
+        # finestre sliding
+        left_win = mask[y - window_height:y, left_base - 50:left_base + 50]
+        right_win = mask[y - window_height:y, right_base - 50:right_base + 50]
 
-        # Sinistra
-        cv2.rectangle(debug_warp, (left_base-50, top_y), (left_base+50, bottom_y), (255, 0, 255), 2)
-        left_win = mask[top_y:bottom_y, left_base-50:left_base+50]
+        # Visualizza finestre sliding
+        cv2.rectangle(transformed_frame, (left_base - 50, y - window_height),
+                      (left_base + 50, y), (255, 0, 255), 2)  # viola
+        cv2.rectangle(transformed_frame, (right_base - 50, y - window_height),
+                      (right_base + 50, y), (0, 255, 0), 2)  # verde
+
         contours, _ = cv2.findContours(left_win, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             M = cv2.moments(contours[0])
@@ -85,9 +90,6 @@ while True:
                 left_base = left_base - 50 + cx
                 left_x.append(left_base)
 
-        # Destra
-        cv2.rectangle(debug_warp, (right_base-50, top_y), (right_base+50, bottom_y), (0, 255, 0), 2)
-        right_win = mask[top_y:bottom_y, right_base-50:right_base+50]
         contours, _ = cv2.findContours(right_win, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             M = cv2.moments(contours[0])
@@ -98,59 +100,64 @@ while True:
 
         y -= window_height
 
-    # Calcolo centro corsia
-    frame_center = 320
-    valid_frame = True
-    lane_center = frame_center  # Default
-
+    # Validità del frame
     if left_x:
         mean_left = int(np.mean(left_x))
-        if mean_left > frame_center:
+        if mean_left > 320:
             valid_frame = False
     if right_x:
         mean_right = int(np.mean(right_x))
-        if mean_right < frame_center:
+        if mean_right < 320:
             valid_frame = False
+    if left_x and right_x and abs(mean_right - mean_left) < 50:
+        print("Linee troppo vicine, ignoro il frame")
+        valid_frame = False
 
+    # Calcolo centro corsia
+    frame_center = 320
     if not valid_frame:
-        print("Falso positivo ignorato")
-        continue  # Salta il frame
+        lane_center = last_valid_lane_center
+    else:
+        if left_x and right_x:
+            lane_center = (mean_left + mean_right) // 2
+        elif left_x:
+            lane_center = mean_left + 100
+        elif right_x:
+            lane_center = mean_right - 100
+        else:
+            lane_center = last_valid_lane_center
+        last_valid_lane_center = lane_center
 
-    # Calcolo centro corsia solo se valido
-    if left_x and right_x:
-        lane_center = (mean_left + mean_right) // 2
-    elif left_x:
-        lane_center = mean_left + 100
-    elif right_x:
-        lane_center = mean_right - 100
-
+    # Calcolo errore e angolo di sterzo
     error = lane_center - frame_center
     angle = -int(error / 3)
-    last_direction = angle
 
-    print(f"Lane center: {lane_center}, Error: {error}, Angle: {angle}")
+    # Debug grafico
+    cv2.line(transformed_frame, (lane_center, 480), (lane_center, 240), (255, 255, 255), 2)
+    cv2.line(transformed_frame, (frame_center, 480), (frame_center, 240), (0, 255, 255), 2)
 
+    # Controllo stato
     if running:
         picarx.forward(20)
         picarx.set_dir_servo_angle(angle)
+        last_direction = angle
     else:
         picarx.stop()
 
-    # Visualizzazioni
-    cv2.line(debug_warp, (lane_center, 0), (lane_center, 480), (0, 0, 255), 2)
-    cv2.imshow("Frame", debug_frame)
-    cv2.imshow("Warp", debug_warp)
-    cv2.imshow("Mask", mask)
-    out.write(debug_frame)
+    # Mostra e salva frame
+    cv2.imshow("Frame", transformed_frame)
+    out.write(transformed_frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
     elif key == ord('s'):
         running = False
+        print("Macchina ferma")
     elif key == ord('r'):
         running = True
+        print("Macchina in movimento")
 
-picarx.stop()
-cv2.destroyAllWindows()
+# Pulizia
 out.release()
+cv2.destroyAllWindows()
