@@ -1,331 +1,288 @@
 import cv2
 import numpy as np
+from picarx import Picarx
+from picamera2 import Picamera2
 import time
-from picarx import Picarx  # Import PiCar-X control library
-from picamera2 import Picamera2  # Import PiCamera2 library
 
-# Initialize PiCar-X
-px = Picarx()
-px.forward(0)  # Start with zero speed
-
-# Constants for PiCar control
-FORWARD_SPEED = 0       # Forward speed (constant)
-MAX_STEERING_ANGLE = 45  # Maximum steering angle
-CENTER_OFFSET = 75 # Reduced for faster response
-STEERING_AGGRESSION = 4  # Amplification factor for steeper turns
-MIN_LANE_WIDTH = 100    # Minimum distance from center to consider valid lane line
-MIN_TOTAL_LANE_WIDTH = 180  # Minimum total lane width to update steering
-
-# Initialize PiCamera2
+# Inizializza la macchina e la fotocamera
+picarx = Picarx()
 picam2 = Picamera2()
-config = picam2.create_preview_configuration(main={"size": (640, 480)})
-picam2.configure(config)
+picam2.preview_configuration.main.size = (640, 480)
+picam2.preview_configuration.main.format = "BGR888"
+picam2.configure("preview")
 picam2.start()
-
-# Wait for camera to initialize
 time.sleep(2)
 
-# Initialize previous steering angle
-previous_steering_angle = 0  # Start with neutral steering
+# Trackbar per calibrazione
+def nothing(x):
+    pass
 
-def average_line(lines, side, width, height):
-    """
-    Calculate average line.
-    If no lines are detected, return a forced vertical line near the left or right edge.
-    """
-    if len(lines) == 0:
-        x_pos = 20 if side == 'left' else width - 20
-        y1, y2 = height, int(height * 0.2)  # from bottom to 20% height
-        return (x_pos, y1, x_pos, y2)
-   
-    x_coords = []
-    y_coords = []
-    for x1, y1, x2, y2 in lines:
-        x_coords += [x1, x2]
-        y_coords += [y1, y2]
-    poly = np.polyfit(y_coords, x_coords, 1)
-    y1, y2 = height, int(height * 0.2)
-    x1 = int(poly[0] * y1 + poly[1])
-    x2 = int(poly[0] * y2 + poly[1])
-    return (x1, y1, x2, y2)
+cv2.namedWindow("Trackbars")
+cv2.createTrackbar("L - H", "Trackbars", 0, 255, nothing)
+cv2.createTrackbar("L - S", "Trackbars", 0, 255, nothing)
+cv2.createTrackbar("L - V", "Trackbars", 180, 255, nothing) # Aumentato valore iniziale per V
+cv2.createTrackbar("U - H", "Trackbars", 255, 255, nothing)
+cv2.createTrackbar("U - S", "Trackbars", 80, 255, nothing) # Aumentata tolleranza per S
+cv2.createTrackbar("U - V", "Trackbars", 255, 255, nothing)
 
-def calculate_steering_angle(left_x, right_x, frame_width):
-    """
-    Calculate the steering angle based on lane position.
-    Adjusted for steeper turns with non-linear response.
-    """
-    lane_center = (left_x + right_x) // 2
-    center_offset = lane_center - (frame_width // 2)
-    
-    max_offset = frame_width // 4  # Reduced for more sensitivity
-    normalized_offset = center_offset / max_offset
-    
-    if normalized_offset != 0:
-        sign = np.sign(normalized_offset)
-        nonlinear_response = sign * (abs(normalized_offset) ** 0.8) * STEERING_AGGRESSION
-        if abs(nonlinear_response) > 1:
-            nonlinear_response = sign * 1.0
-    else:
-        nonlinear_response = 0
-    
-    steering_angle = nonlinear_response * MAX_STEERING_ANGLE
-    return max(min(steering_angle, MAX_STEERING_ANGLE), -MAX_STEERING_ANGLE)
+# Parametri per smorzamento e controllo
+STEERING_SMOOTHING_FACTOR = 0.4
+STEERING_GAIN = 5.0 
+TOLERANCE_PX = 15
+EXPECTED_LANE_WIDTH_PX = 300 # DA CALIBRARE! (es. 250-400 per 640px di larghezza trasformata)
+SERVO_ANGLE_LIMIT = 35
 
-def draw_lane_width_visualization(img, left_x, right_x, lane_width, y_pos, is_valid_width):
-    """
-    Draw lane width visualization with color coding
-    """
-    # Determine color based on lane width and validity
-    if not is_valid_width:
-        color = (0, 0, 255)  # Red for invalid/narrow lane
-        status = "INVALID"
-    else:
-        color = (0, 255, 0)  # Green for acceptable lane width
-        status = "VALID"
-    
-    # Draw horizontal line showing lane width
-    cv2.line(img, (left_x, y_pos), (right_x, y_pos), color, 3)
-    
-    # Draw vertical markers at lane edges
-    cv2.line(img, (left_x, y_pos - 10), (left_x, y_pos + 10), color, 2)
-    cv2.line(img, (right_x, y_pos - 10), (right_x, y_pos + 10), color, 2)
-    
-    # Draw lane width text
-    mid_x = (left_x + right_x) // 2
-    cv2.putText(img, f"{lane_width:.0f}px [{status}]", 
-                (mid_x - 50, y_pos - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    
-    return status
+# Variabili per stato/cronologia
+smoothed_angle = 0.0
+last_valid_lane_center = None
+consecutive_no_lines_frames = 0
+MAX_CONSECUTIVE_NO_LINES = 5
 
-def draw_steering_angle_visualization(img, steering_angle, center_x, center_y, is_angle_updated):
-    """
-    Draw steering angle visualization with arrow and arc
-    """
-    # Calculate arrow endpoint based on steering angle
-    angle_rad = np.deg2rad(-steering_angle)  # Negative for correct direction
-    arrow_length = 60
-    end_x = int(center_x + arrow_length * np.sin(angle_rad))
-    end_y = int(center_y - arrow_length * np.cos(angle_rad))
-    
-    # Determine color based on whether angle was updated
-    if is_angle_updated:
-        # Color based on steering intensity
-        abs_angle = abs(steering_angle)
-        if abs_angle < 10:
-            color = (0, 255, 0)  # Green for small angles
-        elif abs_angle < 25:
-            color = (0, 255, 255)  # Yellow for medium angles
-        else:
-            color = (0, 0, 255)  # Red for large angles
-    else:
-        color = (128, 128, 128)  # Gray for maintained previous angle
-    
-    # Draw center point
-    cv2.circle(img, (center_x, center_y), 5, (255, 255, 255), -1)
-    
-    # Draw steering direction arrow
-    cv2.arrowedLine(img, (center_x, center_y), (end_x, end_y), color, 3, tipLength=0.3)
-    
-    # Draw arc showing angle range
-    if abs(steering_angle) > 2:  # Only draw arc for significant angles
-        start_angle = -90 - abs(steering_angle) if steering_angle > 0 else -90
-        end_angle = -90 + abs(steering_angle) if steering_angle > 0 else -90 + abs(steering_angle)
-        
-        cv2.ellipse(img, (center_x, center_y), (40, 40), 0, 
-                   start_angle, end_angle, color, 2)
+# Proprietà per il testo di debug
+font = cv2.FONT_HERSHEY_SIMPLEX
+font_scale = 0.5
+font_color_info = (255, 255, 255) # Bianco
+font_color_warning = (0, 255, 255) # Giallo per avvisi
+font_color_error = (0, 0, 255)     # Rosso per errori gravi
+thickness = 1
+line_type = cv2.LINE_AA
 
-def filter_lines_by_distance_from_center(lines, frame_center, min_distance):
-    """
-    Filter out lines that are too close to the center of the frame
-    """
-    filtered_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]  # Extract coordinates from nested array
-        # Calculate average x position of the line
-        avg_x = (x1 + x2) / 2
-        # Check if line is far enough from center
-        if abs(avg_x - frame_center) > min_distance:
-            filtered_lines.append(line)
-    return filtered_lines
+# Colori per il debug visivo
+color_roi_points = (0, 0, 255) # Rosso per punti ROI
+color_left_window = (255, 100, 0) # Blu per finestra sinistra
+color_right_window = (0, 100, 255) # Arancione/Rosso per finestra destra
+color_left_points = (255, 180, 100) # Azzurro per punti linea sinistra
+color_right_points = (100, 180, 255) # Rosa per punti linea destra
+color_frame_center = (0, 255, 255) # Giallo per centro frame
+color_lane_center_estimated = (255, 0, 255) # Magenta per centro corsia stimato
+color_mean_lines = (0,255,0) # Verde per linee medie (se disegnate)
+
 
 try:
-    px.forward(FORWARD_SPEED)
-    
     while True:
-        frame = picam2.capture_array()
-            
-        height, width = frame.shape[:2]
-        roi_top = int(height * 0.8)
-        roi_bottom = height
+        frame_orig = picam2.capture_array()
+        frame_height, frame_width = frame_orig.shape[:2]
         
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, roi_top), (width, roi_bottom), (0, 0, 0), -1)
-        alpha = 0.5
-        frame_overlay = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+        # Copia per disegnare ROI sul frame originale
+        frame_with_roi = frame_orig.copy()
+
+        # ROI (Region of Interest)
+        roi_top_y = int(frame_height * 0.55) 
+        roi_bottom_y = frame_height - 20 # Un po' più su dal fondo per evitare bordi
         
-        src_pts = np.float32([
-            [0, roi_top],
-            [width, roi_top],
-            [width, roi_bottom],
-            [0, roi_bottom]
-        ])
-        dst_height = 200
-        dst_width = 300
-        dst_pts = np.float32([
-            [0, 0],
-            [dst_width, 0],
-            [dst_width, dst_height],
-            [0, dst_height]
-        ])
+        roi_top_left_x = int(frame_width * 0.15) # Stringi un po'
+        roi_top_right_x = int(frame_width * 0.85)
+        roi_bottom_left_x = int(frame_width * 0.05)
+        roi_bottom_right_x = int(frame_width * 0.95)
+
+        tl = (roi_top_left_x, roi_top_y)
+        bl = (roi_bottom_left_x, roi_bottom_y)
+        tr = (roi_top_right_x, roi_top_y)
+        br = (roi_bottom_right_x, roi_bottom_y)
+
+        # Disegna i punti ROI sul frame originale
+        for pt in [tl, bl, tr, br]:
+            cv2.circle(frame_with_roi, pt, 7, color_roi_points, -1)
+        # Disegna il poligono ROI
+        cv2.polylines(frame_with_roi, [np.array([tl,tr,br,bl], dtype=np.int32)], isClosed=True, color=(0,255,0), thickness=2)
+
+
+        pts1 = np.float32([tl, bl, tr, br])
+        transformed_width, transformed_height = 640, 480
+        pts2 = np.float32([[0,0], [0,transformed_height], [transformed_width,0], [transformed_width,transformed_height]])
         
-        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        bird_eye_view = cv2.warpPerspective(frame, matrix, (dst_width, dst_height))
+        matrix = cv2.getPerspectiveTransform(pts1, pts2)
+        transformed_frame = cv2.warpPerspective(frame_orig, matrix, (transformed_width, transformed_height))
         
-        hls = cv2.cvtColor(bird_eye_view, cv2.COLOR_BGR2HLS)
+        # Crea una copia a colori per il disegno di debug sulla vista trasformata
+        transformed_frame_display = transformed_frame.copy()
+
+        # Sogliatura HSV
+        hsv = cv2.cvtColor(transformed_frame, cv2.COLOR_BGR2HSV)
+        l_h = cv2.getTrackbarPos("L - H", "Trackbars")
+        l_s = cv2.getTrackbarPos("L - S", "Trackbars")
+        l_v = cv2.getTrackbarPos("L - V", "Trackbars")
+        u_h = cv2.getTrackbarPos("U - H", "Trackbars")
+        u_s = cv2.getTrackbarPos("U - S", "Trackbars")
+        u_v = cv2.getTrackbarPos("U - V", "Trackbars")
+        lower_white = np.array([l_h, l_s, l_v])
+        upper_white = np.array([u_h, u_s, u_v])
+        mask = cv2.inRange(hsv, lower_white, upper_white)
         
-        lower_yellow = np.array([15, 40, 100])
-        upper_yellow = np.array([35, 255, 255])
-        mask_yellow = cv2.inRange(hls, lower_yellow, upper_yellow)
+        # Istogramma
+        histogram = np.sum(mask[mask.shape[0]//2:, :], axis=0)
+        midpoint = int(histogram.shape[0]/2)
+        left_base_candidate = np.argmax(histogram[:midpoint])
+        right_base_candidate = np.argmax(histogram[midpoint:]) + midpoint
+
+        # Sliding window
+        num_windows = 10
+        window_height = int(transformed_frame.shape[0] / num_windows)
+        minpix = 50 
+        window_half_width = 75 # Larghezza mezza finestra
+
+        current_left_x_points = [] # Lista di tuple (x,y)
+        current_right_x_points = []# Lista di tuple (x,y)
         
-        lower_white = np.array([0, 200, 0])
-        upper_white = np.array([180, 255, 255])
-        mask_white = cv2.inRange(hls, lower_white, upper_white)
+        current_left_x_base = left_base_candidate
+        current_right_x_base = right_base_candidate
         
-        mask_combined = cv2.bitwise_or(mask_white, mask_yellow)
+        debug_texts = [] # Lista per messaggi di debug testuali
+
+        for window_idx in range(num_windows):
+            win_y_low = transformed_frame.shape[0] - (window_idx + 1) * window_height
+            win_y_high = transformed_frame.shape[0] - window_idx * window_height
+            win_y_center = (win_y_low + win_y_high) // 2
+            
+            # Finestra sinistra
+            win_xleft_low = current_left_x_base - window_half_width
+            win_xleft_high = current_left_x_base + window_half_width
+            cv2.rectangle(transformed_frame_display,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high),color_left_window, 1) 
+            
+            good_left_inds_y, good_left_inds_x = (mask[win_y_low:win_y_high, max(0,win_xleft_low):min(transformed_width,win_xleft_high)] == 255).nonzero()
+            
+            if len(good_left_inds_x) > minpix:
+                new_left_x_base = max(0,win_xleft_low) + int(np.mean(good_left_inds_x))
+                current_left_x_points.append((new_left_x_base, win_y_center))
+                cv2.circle(transformed_frame_display, (new_left_x_base, win_y_center), 5, color_left_points, -1)
+                current_left_x_base = new_left_x_base
+
+            # Finestra destra
+            win_xright_low = current_right_x_base - window_half_width
+            win_xright_high = current_right_x_base + window_half_width
+            cv2.rectangle(transformed_frame_display,(win_xright_low,win_y_low),(win_xright_high,win_y_high),color_right_window, 1)
+            
+            good_right_inds_y, good_right_inds_x = (mask[win_y_low:win_y_high, max(0, win_xright_low):min(transformed_width,win_xright_high)] == 255).nonzero()
+
+            if len(good_right_inds_x) > minpix:
+                new_right_x_base = max(0,win_xright_low) + int(np.mean(good_right_inds_x))
+                current_right_x_points.append((new_right_x_base, win_y_center))
+                cv2.circle(transformed_frame_display, (new_right_x_base, win_y_center), 5, color_right_points, -1)
+                current_right_x_base = new_right_x_base
         
-        kernel = np.ones((5, 5), np.uint8)
-        mask_cleaned = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel)
+        # Logica di rilevamento e calcolo del centro corsia
+        left_line_detected = len(current_left_x_points) > 2 
+        right_line_detected = len(current_right_x_points) > 2
+        debug_texts.append(f"Left Line: {'Yes' if left_line_detected else 'No'}")
+        debug_texts.append(f"Right Line: {'Yes' if right_line_detected else 'No'}")
+
+        frame_center_x = transformed_frame.shape[1] / 2.0
+        cv2.line(transformed_frame_display, (int(frame_center_x), 0), (int(frame_center_x), transformed_height), color_frame_center, 1)
+
+
+        current_estimated_lane_center = None
+        left_x_mean, right_x_mean = None, None # Per visualizzazione
+
+        if left_line_detected and right_line_detected:
+            left_x_mean = np.mean([p[0] for p in current_left_x_points])
+            right_x_mean = np.mean([p[0] for p in current_right_x_points])
+            
+            detected_width = right_x_mean - left_x_mean
+            if left_x_mean < right_x_mean - (EXPECTED_LANE_WIDTH_PX * 0.3) and \
+               detected_width > EXPECTED_LANE_WIDTH_PX * 0.5 and \
+               detected_width < EXPECTED_LANE_WIDTH_PX * 1.5:
+                current_estimated_lane_center = (left_x_mean + right_x_mean) / 2.0
+                last_valid_lane_center = current_estimated_lane_center
+                consecutive_no_lines_frames = 0
+            else:
+                debug_texts.append("Warn: L/R Crossed or Width Invalid")
+                if last_valid_lane_center is not None:
+                    current_estimated_lane_center = last_valid_lane_center
         
-        edges = cv2.Canny(mask_cleaned, 50, 150)
+        elif left_line_detected:
+            left_x_mean = np.mean([p[0] for p in current_left_x_points])
+            if left_x_mean < frame_center_x - (EXPECTED_LANE_WIDTH_PX * 0.1):
+                current_estimated_lane_center = left_x_mean + EXPECTED_LANE_WIDTH_PX / 2.0
+                # last_valid_lane_center = current_estimated_lane_center # Aggiorna con più cautela se solo una linea
+                consecutive_no_lines_frames = 0
+            else:
+                debug_texts.append("Warn: Left Line Too Far Right")
+                if last_valid_lane_center is not None:
+                    current_estimated_lane_center = last_valid_lane_center
+
+        elif right_line_detected:
+            right_x_mean = np.mean([p[0] for p in current_right_x_points])
+            if right_x_mean > frame_center_x + (EXPECTED_LANE_WIDTH_PX * 0.1):
+                current_estimated_lane_center = right_x_mean - EXPECTED_LANE_WIDTH_PX / 2.0
+                # last_valid_lane_center = current_estimated_lane_center # Aggiorna con più cautela
+                consecutive_no_lines_frames = 0
+            else:
+                debug_texts.append("Warn: Right Line Too Far Left")
+                if last_valid_lane_center is not None:
+                    current_estimated_lane_center = last_valid_lane_center
         
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=30, maxLineGap=120)
+        else: 
+            consecutive_no_lines_frames += 1
+            debug_texts.append(f"No Lines! ({consecutive_no_lines_frames})")
+            if last_valid_lane_center is not None and consecutive_no_lines_frames < MAX_CONSECUTIVE_NO_LINES:
+                current_estimated_lane_center = last_valid_lane_center
         
-        left_lines = []
-        right_lines = []
-        
-        if lines is not None:
-            # Filter lines that are too close to center
-            frame_center = dst_width // 2
-            filtered_lines = filter_lines_by_distance_from_center(lines, frame_center, MIN_LANE_WIDTH)
-            
-            for line in filtered_lines:
-                x1, y1, x2, y2 = line[0]
-                slope = (y2 - y1) / (x2 - x1 + 1e-6)
-                
-                if abs(slope) < 0.6:
-                    continue
-                
-                # Check which side of center the line is on
-                avg_x = (x1 + x2) / 2
-                if avg_x < frame_center and slope < 0:
-                    left_lines.append((x1, y1, x2, y2))
-                elif avg_x > frame_center and slope > 0:
-                    right_lines.append((x1, y1, x2, y2))
-        
-        # Calculate average lines or use default positions if not detected
-        left_line = average_line(left_lines, 'left', dst_width, dst_height)
-        right_line = average_line(right_lines, 'right', dst_width, dst_height)
-        
-        lane_overlay = np.zeros_like(bird_eye_view)
-        
-        # Initialize variables for steering calculation
-        steering_angle = previous_steering_angle
-        is_angle_updated = False
-        
-        if left_line and right_line:
-            lx1, ly1, lx2, ly2 = left_line
-            rx1, ry1, rx2, ry2 = right_line
-            
-            # Draw lane lines
-            cv2.line(bird_eye_view, (lx1, ly1), (lx2, ly2), (255, 0, 0), 3)  # Blue for left
-            cv2.line(bird_eye_view, (rx1, ry1), (rx2, ry2), (0, 255, 255), 3)  # Cyan for right
-            
-            # Fill lane area
-            points = np.array([
-                [lx1, ly1],
-                [rx1, ry1],
-                [rx2, ry2],
-                [lx2, ly2]
-            ])
-            cv2.fillPoly(lane_overlay, [points], (0, 255, 0))
-            
-            left_bottom_x = lx1
-            right_bottom_x = rx1
-            
-            # Calculate lane width
-            lane_width = abs(left_bottom_x - right_bottom_x)
-            
-            # Check if lane width is acceptable and lines are not too close to center
-            left_distance_from_center = abs(left_bottom_x - dst_width // 2)
-            right_distance_from_center = abs(right_bottom_x - dst_width // 2)
-            
-            is_valid_width = (lane_width >= MIN_TOTAL_LANE_WIDTH and 
-                            left_distance_from_center >= MIN_LANE_WIDTH and 
-                            right_distance_from_center >= MIN_LANE_WIDTH)
-            
-            # Update steering angle only if conditions are met
-            if is_valid_width:
-                steering_angle = calculate_steering_angle(left_bottom_x, right_bottom_x, dst_width)
-                previous_steering_angle = steering_angle
-                is_angle_updated = True
-            
-            # Set servo angle
-            px.set_dir_servo_angle(steering_angle)
-            
-            # Draw visualizations
-            lane_width_status = draw_lane_width_visualization(
-                bird_eye_view, left_bottom_x, right_bottom_x, lane_width, 
-                dst_height - 30, is_valid_width
-            )
-            
-            draw_steering_angle_visualization(
-                bird_eye_view, steering_angle, dst_width // 2, dst_height - 60, is_angle_updated
-            )
-            
-            # Display information on main frame
-            status_text = "UPDATED" if is_angle_updated else "MAINTAINED"
-            color = (0, 255, 0) if is_angle_updated else (0, 165, 255)
-            
-            cv2.putText(frame_overlay, f"Steering: {steering_angle:.1f}Â° [{status_text}]", 
-                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-            cv2.putText(frame_overlay, f"Lane Width: {lane_width:.0f}px [{lane_width_status}]", 
-                      (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-            cv2.putText(frame_overlay, f"Aggression: {STEERING_AGGRESSION:.1f}x", 
-                      (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            
-            bird_eye_lane = cv2.addWeighted(bird_eye_view, 1.0, lane_overlay, 0.3, 0)
+        # Disegna linee medie rilevate (opzionale)
+        # if left_x_mean is not None:
+        #     cv2.line(transformed_frame_display, (int(left_x_mean), 0), (int(left_x_mean), transformed_height), color_mean_lines, 1)
+        # if right_x_mean is not None:
+        #     cv2.line(transformed_frame_display, (int(right_x_mean), 0), (int(right_x_mean), transformed_height), color_mean_lines, 1)
+
+        # Disegna il centro della corsia stimato
+        if current_estimated_lane_center is not None:
+            cv2.line(transformed_frame_display, (int(current_estimated_lane_center), 0), (int(current_estimated_lane_center), transformed_height), color_lane_center_estimated, 2)
+            cv2.circle(transformed_frame_display, (int(current_estimated_lane_center), transformed_height - 25), 10, color_lane_center_estimated, -1)
+            debug_texts.append(f"Est. Center: {current_estimated_lane_center:.1f}px")
+
+
+        # Calcolo dello sterzo
+        target_angle = 0.0
+        error_px = 0.0
+
+        if current_estimated_lane_center is not None:
+            error_px = current_estimated_lane_center - frame_center_x
+            if abs(error_px) < TOLERANCE_PX:
+                target_angle = 0.0 
+            else:
+                target_angle = -error_px / STEERING_GAIN
         else:
-            # No lanes detected - maintain previous angle
-            px.set_dir_servo_angle(steering_angle)
-            cv2.putText(frame_overlay, f"No lanes - Maintaining: {steering_angle:.1f}Â°", 
-                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            bird_eye_lane = bird_eye_view.copy()
+            debug_texts.append("No Center -> Target Angle = 0")
+            pass # target_angle rimane 0
+
+        smoothed_angle = (STEERING_SMOOTHING_FACTOR * target_angle) + \
+                         ((1.0 - STEERING_SMOOTHING_FACTOR) * smoothed_angle)
+        final_angle_degrees = np.clip(smoothed_angle, -SERVO_ANGLE_LIMIT, SERVO_ANGLE_LIMIT)
         
-        # Draw center line for reference
-        cv2.line(bird_eye_lane, (dst_width // 2, 0), (dst_width // 2, dst_height), (255, 255, 255), 1)
+        picarx.forward(5)
+        picarx.set_dir_servo_angle(final_angle_degrees)
+
+        # Aggiungi informazioni testuali di sterzata
+        debug_texts.append(f"Error: {error_px:.1f} px")
+        debug_texts.append(f"Target Angle: {target_angle:.1f} deg")
+        debug_texts.append(f"Final Angle: {final_angle_degrees:.1f} deg")
         
-        cv2.imshow("Carreggiata Rilevata", bird_eye_lane)
-        cv2.imshow("Camera View", frame_overlay)
+        # Mostra i testi di debug sull'immagine trasformata
+        y_offset = 20
+        for i, text in enumerate(debug_texts):
+            text_color = font_color_info
+            if "Warn" in text: text_color = font_color_warning
+            if "No Lines!" in text and consecutive_no_lines_frames > 0 : text_color = font_color_error
+            if "No Center" in text : text_color = font_color_error
+
+            cv2.putText(transformed_frame_display, text, (10, y_offset + i * 20), font, font_scale, text_color, thickness, line_type)
         
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        # Disegna la linea di guida (direzione)
+        guide_line_length = 70
+        guide_line_end_x = int(frame_center_x - guide_line_length * np.sin(np.deg2rad(final_angle_degrees))) # X e Y invertiti per angolo sterzo
+        guide_line_end_y = int(transformed_height - guide_line_length * np.cos(np.deg2rad(final_angle_degrees)))
+        cv2.line(transformed_frame_display, (int(frame_center_x), transformed_height -5), (guide_line_end_x, guide_line_end_y), (50,150,255), 3)
+
+
+        # Mostra immagini
+        cv2.imshow("Original Frame (with ROI)", frame_with_roi)
+        cv2.imshow("Bird's Eye View (Debug)", transformed_frame_display)
+        cv2.imshow("Lane Mask", mask)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        elif key == ord('s'):
-            px.forward(0)
-            px.set_dir_servo_angle(0)
-            time.sleep(30)
-            px.forward(FORWARD_SPEED)
-        elif key == ord('+'): 
-            STEERING_AGGRESSION = min(STEERING_AGGRESSION + 0.1, 3.0)
-        elif key == ord('-'):
-            STEERING_AGGRESSION = max(STEERING_AGGRESSION - 0.1, 1.0)
-
-except KeyboardInterrupt:
-    print("Program interrupted by user")
-
 finally:
-    px.forward(0)
-    picam2.stop()
+    print("Stopping PicarX and closing windows.")
+    picarx.stop()
     cv2.destroyAllWindows()
+    if picam2.started:
+        picam2.stop()
