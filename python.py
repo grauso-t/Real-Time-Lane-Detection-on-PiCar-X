@@ -1,48 +1,39 @@
 import cv2
 import numpy as np
+import math
 from picamera2 import Picamera2
-import time
 from picarx import Picarx
 
-class LaneDetector:
+class LineFollower:
     def __init__(self):
-        # Inizializza PiCar-X
+        # Inizializza PicarX
         self.px = Picarx()
         
-        # Inizializza la camera
+        # Inizializza PiCamera2
         self.picam2 = Picamera2()
-        camera_config = self.picam2.create_preview_configuration(
-            main={"size": (640, 480)}
-        )
-        self.picam2.configure(camera_config)
+        config = self.picam2.create_preview_configuration(main={"size": (640, 480)})
+        self.picam2.configure(config)
         self.picam2.start()
         
-        # Parametri di velocità e sterzo
+        # Parametri di controllo
         self.speed = 1
         self.max_angle = 45
-        self.previous_steering_angle = 0  # Memorizza l'angolo precedente
         
         # Parametri per bird's eye view
         self.dst_height = 200
         self.dst_width = 300
         
-        # Parametri per Hough Transform
-        self.hough_threshold = 50
-        self.min_line_length = 50
-        self.max_line_gap = 20
+        # Parametri per filtro HSV
+        # Range per linee bianche
+        self.white_lower = np.array([0, 0, 200])
+        self.white_upper = np.array([180, 25, 255])
         
-        # Parametri per validazione carreggiata
-        self.min_lane_width = 100  # Larghezza minima carreggiata (px)
-        self.max_lane_width = 300  # Larghezza massima carreggiata (px)
-        self.min_distance_from_center = 50  # Distanza minima dal centro (px)
+        # Range per linee gialle
+        self.yellow_lower = np.array([15, 100, 100])
+        self.yellow_upper = np.array([35, 255, 255])
         
-        # Buffer per stabilizzare le linee
-        self.left_line_buffer = []
-        self.right_line_buffer = []
-        self.buffer_size = 5
-        
-    def create_bird_eye_transform(self, width, height):
-        """Crea la matrice di trasformazione per bird's eye view"""
+    def get_bird_eye_transform(self, width, height):
+        """Calcola la matrice di trasformazione per bird's eye view"""
         roi_top = int(height * 0.8)
         roi_bottom = height
         
@@ -62,40 +53,34 @@ class LaneDetector:
         
         return cv2.getPerspectiveTransform(src_pts, dst_pts)
     
-    def detect_lane_colors(self, frame):
+    def detect_lines_hsv(self, frame):
         """Rileva linee bianche e gialle usando filtro HSV"""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Maschere per colori bianchi
-        lower_white = np.array([0, 0, 200])
-        upper_white = np.array([180, 25, 255])
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
+        # Maschera per linee bianche
+        white_mask = cv2.inRange(hsv, self.white_lower, self.white_upper)
         
-        # Maschere per colori gialli
-        lower_yellow = np.array([15, 50, 50])
-        upper_yellow = np.array([35, 255, 255])
-        yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        # Maschera per linee gialle
+        yellow_mask = cv2.inRange(hsv, self.yellow_lower, self.yellow_upper)
         
         # Combina le maschere
         combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
         
         return combined_mask, white_mask, yellow_mask
     
-    def apply_gaussian_blur(self, image, kernel_size=5):
-        """Applica filtro gaussiano"""
-        return cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
-    
-    def detect_lines_hough(self, edges):
-        """Rileva linee usando Hough Transform"""
-        lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi/180,
-            threshold=self.hough_threshold,
-            minLineLength=self.min_line_length,
-            maxLineGap=self.max_line_gap
-        )
-        return lines
+    def apply_gaussian_hough(self, mask):
+        """Applica filtro gaussiano e Hough Transform"""
+        # Filtro gaussiano
+        blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+        
+        # Edge detection
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Hough Transform per rilevare linee
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, 
+                               minLineLength=30, maxLineGap=20)
+        
+        return edges, lines
     
     def classify_lines(self, lines, width):
         """Classifica le linee in sinistra e destra"""
@@ -105,25 +90,27 @@ class LaneDetector:
         if lines is not None:
             for line in lines:
                 x1, y1, x2, y2 = line[0]
-                slope = (y2 - y1) / (x2 - x1) if x2 != x1 else 0
                 
-                # Filtra per pendenza ragionevole
-                if abs(slope) < 0.3:
-                    continue
-                
-                # Classifica in base alla posizione e pendenza
-                if slope < 0 and x1 < width // 2 and x2 < width // 2:
-                    left_lines.append(line[0])
-                elif slope > 0 and x1 > width // 2 and x2 > width // 2:
-                    right_lines.append(line[0])
+                # Calcola la pendenza
+                if x2 != x1:
+                    slope = (y2 - y1) / (x2 - x1)
+                    
+                    # Classifica in base alla posizione e pendenza
+                    center_x = (x1 + x2) / 2
+                    
+                    if center_x < width / 2 and slope < 0:  # Linea sinistra
+                        left_lines.append(line[0])
+                    elif center_x > width / 2 and slope > 0:  # Linea destra
+                        right_lines.append(line[0])
         
         return left_lines, right_lines
     
-    def average_lines(self, lines):
-        """Calcola la linea media da un set di linee"""
+    def extrapolate_line(self, lines, height, width):
+        """Estrapolazione di una linea dai segmenti rilevati"""
         if not lines:
             return None
-        
+            
+        # Calcola la linea media
         x_coords = []
         y_coords = []
         
@@ -134,238 +121,177 @@ class LaneDetector:
         
         if len(x_coords) < 2:
             return None
-        
-        # Calcola regressione lineare
-        poly = np.polyfit(y_coords, x_coords, 1)
-        
-        # Calcola punti della linea
-        y1 = self.dst_height
-        y2 = 0
-        x1 = int(poly[0] * y1 + poly[1])
-        x2 = int(poly[0] * y2 + poly[1])
-        
-        return [x1, y1, x2, y2]
-    
-    def create_lane_triangle(self, left_line, right_line, width, height):
-        """Crea triangolo della carreggiata gestendo linee mancanti"""
-        lane_points = []
-        
-        if left_line is not None:
-            x1, y1, x2, y2 = left_line
-            lane_points.extend([[x1, y1], [x2, y2]])
-        else:
-            # Assume linea sinistra in basso a sinistra
-            lane_points.extend([[0, height], [width//4, 0]])
-        
-        if right_line is not None:
-            x1, y1, x2, y2 = right_line
-            lane_points.extend([[x2, y2], [x1, y1]])
-        else:
-            # Assume linea destra in basso a destra
-            lane_points.extend([[3*width//4, 0], [width, height]])
-        
-        return np.array(lane_points, dtype=np.int32)
-    
-    def calculate_lane_width(self, left_line, right_line):
-        """Calcola la larghezza della carreggiata"""
-        if left_line is None or right_line is None:
-            return None
-        
-        # Calcola la distanza media tra le linee
-        left_center_x = (left_line[0] + left_line[2]) // 2
-        right_center_x = (right_line[0] + right_line[2]) // 2
-        
-        lane_width = abs(right_center_x - left_center_x)
-        return lane_width
-    
-    def is_line_too_close_to_center(self, line, center_x):
-        """Verifica se una linea è troppo vicina al centro"""
-        if line is None:
-            return False
-        
-        line_center_x = (line[0] + line[2]) // 2
-        distance_from_center = abs(line_center_x - center_x)
-        
-        return distance_from_center < self.min_distance_from_center
-    
-    def validate_lane_detection(self, left_line, right_line, width):
-        """Valida il rilevamento della carreggiata"""
-        center_x = width // 2
-        
-        # Caso 1: Entrambe le linee presenti
-        if left_line is not None and right_line is not None:
-            lane_width = self.calculate_lane_width(left_line, right_line)
             
-            # Verifica larghezza carreggiata
-            if lane_width < self.min_lane_width:
-                return False, f"Carreggiata troppo stretta: {lane_width}px"
-            
-            # Verifica se le linee sono troppo vicine al centro
-            if (self.is_line_too_close_to_center(left_line, center_x) or 
-                self.is_line_too_close_to_center(right_line, center_x)):
-                return False, "Linee troppo vicine al centro"
+        # Fit lineare
+        coeffs = np.polyfit(y_coords, x_coords, 1)
         
-        # Caso 2: Solo una linea presente
-        elif left_line is not None:
-            if self.is_line_too_close_to_center(left_line, center_x):
-                return False, "Linea sinistra troppo vicina al centro"
+        # Calcola punti estremi
+        y_top = 0
+        y_bottom = height
+        x_top = int(coeffs[0] * y_top + coeffs[1])
+        x_bottom = int(coeffs[0] * y_bottom + coeffs[1])
         
-        elif right_line is not None:
-            if self.is_line_too_close_to_center(right_line, center_x):
-                return False, "Linea destra troppo vicina al centro"
-        
-        return True, "Rilevamento valido"
-        """Calcola l'angolo di sterzo basato sulle linee rilevate"""
-        center_x = width // 2
-        
-        if left_line is not None and right_line is not None:
-            # Entrambe le linee presenti
-            left_x = (left_line[0] + left_line[2]) // 2
-            right_x = (right_line[0] + right_line[2]) // 2
-            lane_center = (left_x + right_x) // 2
-        elif left_line is not None:
-            # Solo linea sinistra
-            left_x = (left_line[0] + left_line[2]) // 2
-            lane_center = left_x + width // 4
-        elif right_line is not None:
-            # Solo linea destra
-            right_x = (right_line[0] + right_line[2]) // 2
-            lane_center = right_x - width // 4
-        else:
-            # Nessuna linea rilevata
-            lane_center = center_x
-        
-        # Calcola offset dal centro
-        offset = lane_center - center_x
-        
-        # Converte offset in angolo di sterzo
-        steering_angle = np.arctan(offset / (width // 2)) * 180 / np.pi
-        
-        # Limita l'angolo massimo
-        steering_angle = np.clip(steering_angle, -self.max_angle, self.max_angle)
-        
-        return steering_angle
+        return [(x_top, y_top), (x_bottom, y_bottom)]
     
-    def draw_lane_overlay(self, frame, lane_points, alpha=0.5):
-        """Disegna overlay della carreggiata con trasparenza"""
-        overlay = frame.copy()
-        cv2.fillPoly(overlay, [lane_points], (0, 255, 0))
-        return cv2.addWeighted(frame, 1-alpha, overlay, alpha, 0)
-    
-    def process_frame(self, frame):
-        """Processa un singolo frame"""
+    def create_lane_overlay(self, frame, left_line, right_line):
+        """Crea overlay della carreggiata con triangolo se manca una linea"""
+        overlay = np.zeros_like(frame)
         height, width = frame.shape[:2]
         
-        # Crea bird's eye view
-        M = self.create_bird_eye_transform(width, height)
-        bird_eye = cv2.warpPerspective(frame, M, (self.dst_width, self.dst_height))
+        # Punti del poligono della carreggiata
+        if left_line and right_line:
+            # Entrambe le linee presenti - trapezio normale
+            points = np.array([
+                left_line[0], left_line[1],
+                right_line[1], right_line[0]
+            ], np.int32)
+        elif left_line and not right_line:
+            # Solo linea sinistra - triangolo a destra
+            points = np.array([
+                left_line[0], left_line[1],
+                (width, height), (width, 0)
+            ], np.int32)
+        elif right_line and not left_line:
+            # Solo linea destra - triangolo a sinistra
+            points = np.array([
+                (0, 0), (0, height),
+                right_line[1], right_line[0]
+            ], np.int32)
+        else:
+            # Nessuna linea - nessun overlay
+            return overlay
         
-        # Rileva colori delle linee
-        lane_mask, white_mask, yellow_mask = self.detect_lane_colors(bird_eye)
+        # Riempi il poligono
+        cv2.fillPoly(overlay, [points], (0, 255, 0))
         
-        # Applica filtro gaussiano
-        blurred = self.apply_gaussian_blur(lane_mask)
+        return overlay
+    
+    def calculate_steering_angle(self, left_line, right_line, width):
+        """Calcola l'angolo di sterzata"""
+        height = self.dst_height
         
-        # Rileva bordi
-        edges = cv2.Canny(blurred, 50, 150)
+        if left_line and right_line:
+            # Entrambe le linee presenti - segui il centro
+            left_bottom = left_line[1][0]
+            right_bottom = right_line[1][0]
+            lane_center = (left_bottom + right_bottom) / 2
+            frame_center = width / 2
+            
+        elif left_line and not right_line:
+            # Solo linea sinistra - calcola angolo del triangolo
+            x1, y1 = left_line[0]
+            x2, y2 = left_line[1]
+            
+            # Angolo della linea rispetto alla verticale
+            angle_rad = math.atan2(x2 - x1, y2 - y1)
+            steering_angle = math.degrees(angle_rad)
+            
+            return max(-self.max_angle, min(self.max_angle, steering_angle))
+            
+        elif right_line and not left_line:
+            # Solo linea destra - calcola angolo del triangolo
+            x1, y1 = right_line[0]
+            x2, y2 = right_line[1]
+            
+            # Angolo della linea rispetto alla verticale
+            angle_rad = math.atan2(x2 - x1, y2 - y1)
+            steering_angle = -math.degrees(angle_rad)
+            
+            return max(-self.max_angle, min(self.max_angle, steering_angle))
+        else:
+            # Nessuna linea - vai dritto
+            return 0
         
-        # Rileva linee con Hough
-        lines = self.detect_lines_hough(edges)
+        # Calcola errore dal centro
+        error = lane_center - frame_center
+        steering_angle = error * 0.3  # Fattore di conversione
         
-        # Classifica linee
-        left_lines, right_lines = self.classify_lines(lines, self.dst_width)
-        
-        # Calcola linee medie
-        left_line = self.average_lines(left_lines)
-        right_line = self.average_lines(right_lines)
-        
-        # Crea triangolo della carreggiata
-        lane_points = self.create_lane_triangle(left_line, right_line, 
-                                               self.dst_width, self.dst_height)
-        
-        # Calcola angolo di sterzo
-        steering_angle, status_message = self.calculate_steering_angle(left_line, right_line, 
-                                                                      self.dst_width)
-        
-        # Crea visualizzazioni
-        result_frame = bird_eye.copy()
-        
-        # Disegna linee rilevate
-        if left_line is not None:
-            cv2.line(result_frame, (left_line[0], left_line[1]), 
-                    (left_line[2], left_line[3]), (255, 0, 0), 3)
-        if right_line is not None:
-            cv2.line(result_frame, (right_line[0], right_line[1]), 
-                    (right_line[2], right_line[3]), (0, 0, 255), 3)
-        
-        # Disegna overlay della carreggiata
-        result_frame = self.draw_lane_overlay(result_frame, lane_points, 0.5)
-        
-        # Crea immagini per la visualizzazione
-        hough_vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        filter_vis = cv2.cvtColor(lane_mask, cv2.COLOR_GRAY2BGR)
-        
-        return result_frame, hough_vis, filter_vis, steering_angle, status_message
+        return max(-self.max_angle, min(self.max_angle, steering_angle))
     
     def run(self):
-        """Loop principale del sistema"""
-        print("Avvio sistema di rilevamento corsie...")
-        
+        """Loop principale"""
         try:
             while True:
-                # Cattura frame dalla camera
+                # Cattura frame
                 frame = self.picam2.capture_array()
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 
-                # Processa il frame
-                result, hough_vis, filter_vis, steering_angle, status_message = self.process_frame(frame)
+                height, width = frame.shape[:2]
                 
-                # Controlla il veicolo
-                self.px.set_dir_servo_angle(int(steering_angle))
+                # Trasformazione bird's eye view
+                M = self.get_bird_eye_transform(width, height)
+                bird_eye = cv2.warpPerspective(frame, M, (self.dst_width, self.dst_height))
+                
+                # Rilevamento linee con HSV
+                combined_mask, white_mask, yellow_mask = self.detect_lines_hsv(bird_eye)
+                
+                # Applicazione Gaussian e Hough
+                edges, lines = self.apply_gaussian_hough(combined_mask)
+                
+                # Classificazione linee
+                left_lines, right_lines = self.classify_lines(lines, self.dst_width)
+                
+                # Estrapolazione linee
+                left_line = self.extrapolate_line(left_lines, self.dst_height, self.dst_width)
+                right_line = self.extrapolate_line(right_lines, self.dst_height, self.dst_width)
+                
+                # Calcola angolo di sterzata
+                steering_angle = self.calculate_steering_angle(left_line, right_line, self.dst_width)
+                
+                # Controllo del robot
                 self.px.forward(self.speed)
+                self.px.set_dir_servo_angle(steering_angle)
                 
-                # Crea visualizzazione combinata
-                top_row = np.hstack([filter_vis, hough_vis])
-                bottom_row = np.hstack([result, cv2.resize(frame, (300, 200))])
-                combined = np.vstack([top_row, bottom_row])
+                # Visualizzazione
+                # Overlay della carreggiata
+                overlay = self.create_lane_overlay(bird_eye, left_line, right_line)
+                result = cv2.addWeighted(bird_eye, 1.0, overlay, 0.5, 0)
                 
-                # Aggiungi testo informativo
-                cv2.putText(combined, f"Steering: {steering_angle:.1f}°", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(combined, f"Speed: {self.speed}", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(combined, status_message, 
-                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                # Disegna le linee rilevate
+                if left_line:
+                    cv2.line(result, left_line[0], left_line[1], (255, 0, 0), 3)
+                if right_line:
+                    cv2.line(result, right_line[0], right_line[1], (0, 0, 255), 3)
                 
-                # Mostra il risultato
-                cv2.imshow('Lane Detection System', combined)
+                # Combina le visualizzazioni
+                display_frame = np.zeros((height, width * 2, 3), dtype=np.uint8)
+                
+                # Frame originale (ridimensionato)
+                original_resized = cv2.resize(frame, (width, height))
+                display_frame[:, :width] = original_resized
+                
+                # Risultati processing (ridimensionato)
+                result_resized = cv2.resize(result, (width, height))
+                display_frame[:, width:] = result_resized
+                
+                # Informazioni di debug
+                cv2.putText(display_frame, f"Steering: {steering_angle:.1f}°", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(display_frame, f"Speed: {self.speed}", 
+                           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                
+                # Mostra il frame
+                cv2.imshow('Line Following', display_frame)
+                cv2.imshow('Hough Edges', edges)
+                cv2.imshow('HSV Mask', combined_mask)
                 
                 # Controlli da tastiera
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
                 elif key == ord('s'):
-                    # Stop
-                    self.px.stop()
-                elif key == ord('r'):
-                    # Resume
-                    pass
-                
-                time.sleep(0.1)
-                
+                    # Salva screenshot
+                    cv2.imwrite('screenshot.jpg', display_frame)
+                    print("Screenshot salvato!")
+                    
         except KeyboardInterrupt:
-            print("Interruzione da tastiera...")
-        
+            print("Interruzione da tastiera")
         finally:
             # Cleanup
             self.px.stop()
             self.picam2.stop()
             cv2.destroyAllWindows()
-            print("Sistema arrestato.")
-
-def main():
-    detector = LaneDetector()
-    detector.run()
 
 if __name__ == "__main__":
-    main()
+    line_follower = LineFollower()
+    line_follower.run()
