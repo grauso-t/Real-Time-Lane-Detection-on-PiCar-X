@@ -100,14 +100,29 @@ while True:
 
     # Calcolo centro corsia
     frame_center = 320
+    valid_frame = True
+    lane_center = frame_center  # Default
+
+    if left_x:
+        mean_left = int(np.mean(left_x))
+        if mean_left > frame_center:
+            valid_frame = False
+    if right_x:
+        mean_right = int(np.mean(right_x))
+        if mean_right < frame_center:
+            valid_frame = False
+
+    if not valid_frame:
+        print("Falso positivo ignorato")
+        continue  # Salta il frame
+
+    # Calcolo centro corsia solo se valido
     if left_x and right_x:
-        lane_center = (int(np.mean(left_x)) + int(np.mean(right_x))) // 2
+        lane_center = (mean_left + mean_right) // 2
     elif left_x:
-        lane_center = int(np.mean(left_x)) + 100
+        lane_center = mean_left + 100
     elif right_x:
-        lane_center = int(np.mean(right_x)) - 100
-    else:
-        lane_center = frame_center
+        lane_center = mean_right - 100
 
     error = lane_center - frame_center
     angle = -int(error / 3)
