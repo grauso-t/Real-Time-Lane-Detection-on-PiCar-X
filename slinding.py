@@ -100,19 +100,13 @@ while True:
 
     # Calcolo centro corsia
     frame_center = 320
-    offset = 150
-
     if left_x and right_x:
-        # Priorità alla linea sinistra: 150 px a destra di essa
-        lane_center = int(np.mean(left_x)) + offset
+        lane_center = (int(np.mean(left_x)) + int(np.mean(right_x))) // 2
     elif left_x:
-        # Solo sinistra: 150 px a destra
-        lane_center = int(np.mean(left_x)) + offset
+        lane_center = int(np.mean(left_x)) + 100
     elif right_x:
-        # Solo destra: 150 px a sinistra
-        lane_center = int(np.mean(right_x)) - offset
+        lane_center = int(np.mean(right_x)) - 100
     else:
-        # Nessuna linea visibile
         lane_center = frame_center
 
     error = lane_center - frame_center
@@ -122,7 +116,7 @@ while True:
     print(f"Lane center: {lane_center}, Error: {error}, Angle: {angle}")
 
     if running:
-        picarx.forward(1)
+        picarx.forward(20)
         picarx.set_dir_servo_angle(angle)
     else:
         picarx.stop()
@@ -132,7 +126,7 @@ while True:
     cv2.imshow("Frame", debug_frame)
     cv2.imshow("Warp", debug_warp)
     cv2.imshow("Mask", mask)
-    out.write(debug_warp)
+    out.write(debug_frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
