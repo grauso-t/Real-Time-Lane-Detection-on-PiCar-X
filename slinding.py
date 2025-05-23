@@ -11,8 +11,9 @@ picam2.preview_configuration.main.size = (640, 480)
 picam2.preview_configuration.main.format = "BGR888"
 picam2.configure("preview")
 picam2.start()
-time.sleep(2)
+time.sleep(2)  # attesa per stabilizzare la fotocamera
 
+# Trackbar per calibrazione
 def nothing(x):
     pass
 
@@ -30,41 +31,48 @@ while True:
     frame = picam2.capture_array()
     frame = cv2.resize(frame, (640, 480))
 
-    # ROI e bird's eye
-    tl, bl, tr, br = (70,220), (0,472), (570,220), (640,472)
+    # ROI
+    tl = (70,220)
+    bl = (0,472)
+    tr = (570,220)
+    br = (640,472)
+
+    for pt in [tl, bl, tr, br]:
+        cv2.circle(frame, pt, 5, (0,0,255), -1)
+
     pts1 = np.float32([tl, bl, tr, br])
     pts2 = np.float32([[0,0], [0,480], [640,0], [640,480]])
     matrix = cv2.getPerspectiveTransform(pts1, pts2)
-    birdseye = cv2.warpPerspective(frame, matrix, (640, 480))
+    transformed_frame = cv2.warpPerspective(frame, matrix, (640, 480))
 
-    # Maschera HSV
-    hsv = cv2.cvtColor(birdseye, cv2.COLOR_BGR2HSV)
-    lower = np.array([cv2.getTrackbarPos("L - H", "Trackbars"),
-                      cv2.getTrackbarPos("L - S", "Trackbars"),
-                      cv2.getTrackbarPos("L - V", "Trackbars")])
-    upper = np.array([cv2.getTrackbarPos("U - H", "Trackbars"),
-                      cv2.getTrackbarPos("U - S", "Trackbars"),
-                      cv2.getTrackbarPos("U - V", "Trackbars")])
+    # Sogliatura HSV
+    hsv = cv2.cvtColor(transformed_frame, cv2.COLOR_BGR2HSV)
+    l_h = cv2.getTrackbarPos("L - H", "Trackbars")
+    l_s = cv2.getTrackbarPos("L - S", "Trackbars")
+    l_v = cv2.getTrackbarPos("L - V", "Trackbars")
+    u_h = cv2.getTrackbarPos("U - H", "Trackbars")
+    u_s = cv2.getTrackbarPos("U - S", "Trackbars")
+    u_v = cv2.getTrackbarPos("U - V", "Trackbars")
+    lower = np.array([l_h, l_s, l_v])
+    upper = np.array([u_h, u_s, u_v])
     mask = cv2.inRange(hsv, lower, upper)
 
     # Istogramma
     histogram = np.sum(mask[mask.shape[0]//2:, :], axis=0)
-    midpoint = int(histogram.shape[0] / 2)
+    midpoint = int(histogram.shape[0]/2)
     left_base = np.argmax(histogram[:midpoint])
     right_base = np.argmax(histogram[midpoint:]) + midpoint
 
     # Sliding window
     y = 472
     window_height = 40
-    left_x, right_x, centers = [], [], []
-    sliding_vis = cv2.cvtColor(mask.copy(), cv2.COLOR_GRAY2BGR)
+    left_x, right_x = [], []
 
     while y > 0:
-        lw = mask[y-window_height:y, left_base-50:left_base+50]
-        rw = mask[y-window_height:y, right_base-50:right_base+50]
+        left_win = mask[y-window_height:y, left_base-50:left_base+50]
+        right_win = mask[y-window_height:y, right_base-50:right_base+50]
 
-        # Linea sinistra
-        contours, _ = cv2.findContours(lw, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(left_win, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             M = cv2.moments(contours[0])
             if M["m00"] != 0:
@@ -72,8 +80,7 @@ while True:
                 left_base = left_base - 50 + cx
                 left_x.append(left_base)
 
-        # Linea destra
-        contours, _ = cv2.findContours(rw, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(right_win, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             M = cv2.moments(contours[0])
             if M["m00"] != 0:
@@ -81,30 +88,16 @@ while True:
                 right_base = right_base - 50 + cx
                 right_x.append(right_base)
 
-        # Visualizzazione sliding window
-        cv2.rectangle(sliding_vis, (left_base-50, y-window_height), (left_base+50, y), (255,0,0), 2)
-        cv2.rectangle(sliding_vis, (right_base-50, y-window_height), (right_base+50, y), (0,255,0), 2)
-        if left_base and right_base:
-            center = (left_base + right_base) // 2
-            centers.append(center)
-            cv2.circle(sliding_vis, (center, y - window_height//2), 4, (0,0,255), -1)
-
         y -= window_height
 
-    # Comportamento guida
+    # Calcolo centro corsia e sterzata
     frame_center = 320
     if left_x and right_x:
         lane_center = (int(np.mean(left_x)) + int(np.mean(right_x))) // 2
-        centers.append(lane_center)
         error = lane_center - frame_center
-
-        curve_strength = np.var(centers)
-        curva = curve_strength > 3000  # soglia da calibrare
-        angle = -int(error / (2 if curva else 4))
-        speed = 10 if curva else 20
-
+        angle = -int(error / 3)
         last_direction = angle
-        picarx.forward(speed)
+        picarx.forward(20)
         picarx.set_dir_servo_angle(angle)
 
     elif left_x and not right_x:
@@ -112,7 +105,7 @@ while True:
         error = lane_center - frame_center
         angle = -int(error / 3)
         last_direction = angle
-        picarx.forward(15)
+        picarx.forward(20)
         picarx.set_dir_servo_angle(angle)
 
     elif right_x and not left_x:
@@ -120,20 +113,17 @@ while True:
         error = lane_center - frame_center
         angle = -int(error / 3)
         last_direction = angle
-        picarx.forward(15)
+        picarx.forward(20)
         picarx.set_dir_servo_angle(angle)
 
     else:
-        # fallback: continua dritto mantenendo ultima direzione
-        picarx.forward(10)
+        picarx.forward(20)
         picarx.set_dir_servo_angle(last_direction)
 
-    # Visualizzazione
-    cv2.imshow("Bird's Eye", birdseye)
+    # Mostra immagini (facoltativo)
+    cv2.imshow("Frame", frame)
     cv2.imshow("Mask", mask)
-    cv2.imshow("Sliding Window", sliding_vis)
-
-    if cv2.waitKey(1) == 27:
+    if cv2.waitKey(1) == 27:  # ESC per uscire
         break
 
 cv2.destroyAllWindows()
