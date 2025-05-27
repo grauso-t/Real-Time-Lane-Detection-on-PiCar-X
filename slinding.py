@@ -1,320 +1,308 @@
 import cv2
 import numpy as np
-from picarx import Picarx # DECOMMENTA
-from picamera2 import Picamera2 # DECOMMENTA
-import time # UTILE PER LA CAMERA E CONTROLLI
+import os
+import time
+from picamera2 import Picamera2
+from picarx import Picarx
 
-# Inizializzazione PicarX e Picamera2
-picarx = Picarx() # DECOMMENTA
+# Costanti per simulazione
+MAX_STEERING_ANGLE    = 45    # gradi
+STEERING_AGGRESSION   = 1
+MIN_LANE_WIDTH        = 120   # px, soglia per carreggiata piccola
+MIN_CENTER_DISTANCE   = 30    # px, soglia distanza minima linea-centro
+OUTPUT_DIR            = "./ignored_frames"
+
+# Costanti per PicarX
+BASE_SPEED           = 0     # velocitÃ  base del veicolo
+STEERING_MULTIPLIER  = 10      # moltiplicatore per conversione angolo->servo
+
+# Setup directories
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Inizializzazione PicarX
+print("Inizializzazione PicarX...")
+px = Picarx()
+px.forward(0)  # ferma il veicolo all'avvio
+
+# Inizializzazione Picamera2
+print("Inizializzazione Picamera2...")
 picam2 = Picamera2()
-camera_config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
-picam2.configure(camera_config)
+
+# Configurazione camera per ottimizzare prestazioni
+config = picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"},
+    controls={"FrameRate": 30}
+)
+picam2.configure(config)
 picam2.start()
-time.sleep(1)
 
-# Trackbar HSV
-def nothing(x): pass
-cv2.namedWindow("Trackbars")
-cv2.createTrackbar("L - H", "Trackbars", 0, 255, nothing)
-cv2.createTrackbar("L - S", "Trackbars", 0, 255, nothing)
-cv2.createTrackbar("L - V", "Trackbars", 200, 255, nothing)
-cv2.createTrackbar("U - H", "Trackbars", 255, 255, nothing)
-cv2.createTrackbar("U - S", "Trackbars", 50, 255, nothing)
-cv2.createTrackbar("U - V", "Trackbars", 255, 255, nothing)
+# Variabili globali
+previous_steering_angle = 0.0
+ignored_count = 0
+running = True
 
-# Parametri globali
-last_direction = 0
-filtered_angle = 0 # Non sembra usato, forse retaggio?
-valid_lane_center = 320
-invalid_frame_count = 0
-MAX_INVALID_FRAMES = 10 # Aumenta a 15-20 se serve più tolleranza
-
-# --- PARAMETRI DI CONTROLLO DA FARE TUNING ---
-K_DIVISOR = 2.8       # FASE 1: RIDUCI QUESTO VALORE (era 3.5). Inizia con 3.2, poi 3.0, 2.8 etc.
-ALPHA_SMOOTHING = 0.4 # FASE 1: AUMENTA QUESTO VALORE (era 0.3). Prova 0.4, 0.5.
-MAX_SERVO_ANGLE = 45  # Limite fisico del servo PicarX
-
-# Parametri per controllo velocità (FASE 2)
-ENABLE_DYNAMIC_SPEED = True # Imposta a True per attivare la Fase 2
-MAX_SPEED = 25             # Velocità massima (0-100 per PicarX forward)
-MIN_SPEED = 12             # Velocità minima in curva
-SPEED_REDUCTION_THRESHOLD_ANGLE = 18 # Angolo (in gradi) oltre cui si inizia a ridurre velocità
-# --- FINE PARAMETRI DI CONTROLLO ---
-
-
-estimated_lane_width = 459 # Inizializza con un valore plausibile
-MIN_PLAUSIBLE_LANE_WIDTH = 350 # Riduci un po' per maggiore flessibilità
-MAX_PLAUSIBLE_LANE_WIDTH = 550 # Aumenta un po'
-LANE_WIDTH_SMOOTH_ALPHA = 0.01
-
-frame_center_x = 320
-
-MIN_PEAK_STRENGTH_RATIO = 0.3
-MIN_SEPARATION_FOR_TWO_LINES = 80
-LANE_SIDE_CONFIDENCE_THRESHOLD = 50
-WINDOW_SEARCH_MARGIN = 50 # Margine per le finestre di sliding
-MIN_CONTOUR_AREA_IN_WINDOW = 20 # Riduci se le linee sono sottili
-
-def smooth_angle_func(current, previous, alpha_val): # Rinominato per chiarezza
-    return int(alpha_val * current + (1 - alpha_val) * previous)
-
-def draw_windows(image, win_y_low, win_y_high, left_center_x, right_center_x,
-                 color_left=(255,0,255), color_right=(0,255,0),
-                 draw_left_flag=False, draw_right_flag=False):
-    if draw_left_flag:
-        cv2.rectangle(image, (left_center_x - WINDOW_SEARCH_MARGIN, win_y_low),
-                      (left_center_x + WINDOW_SEARCH_MARGIN, win_y_high), color_left, 2)
-    if draw_right_flag:
-        cv2.rectangle(image, (right_center_x - WINDOW_SEARCH_MARGIN, win_y_low),
-                      (right_center_x + WINDOW_SEARCH_MARGIN, win_y_high), color_right, 2)
-    return image
-
-try:
-    while True:
-        frame = picam2.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        
-        # CALIBRA QUESTI PUNTI CON PRECISIONE SULLA TUA PISTARX!
-        # tl, bl, tr, br = (70,400), (0,480), (570,400), (640,480) # Vecchi
-        # Esempio di punti per una vista più "bird-eye" se la camera è angolata
-        # Devi sperimentare! Crea uno script a parte per aiutarti a trovare questi punti.
-        # tl, bl, tr, br = (200,300), (0,480), (440,300), (640,480) # Esempio
-        # Immaginiamo che i tuoi (70,400), (0,480), (570,400), (640,480) siano ancora validi
-        # Assicurati che l'area ROI sia sensata per la tua pista e la PicarX
-        # Potrebbe essere necessario aggiustare l'altezza (secondo valore Y) dei punti superiori
-        # tl=(x_top_left, y_top_horizon), bl=(x_bottom_left, y_bottom_image)
-        # tr=(x_top_right, y_top_horizon), br=(x_bottom_right, y_bottom_image)
-        # Se le curve sono molto strette, potresti voler un y_top_horizon più basso (es. 350 invece di 400)
-        # per "vedere" la curva prima.
-        ROI_TOP_Y = 380 # Prova a variare questo (es. 350, 380, 400, 420)
-        ROI_BOTTOM_Y = 480
-        ROI_TL_X_OFFSET = 70  # Distanza dal bordo sx per il punto top-left
-        ROI_TR_X_OFFSET = 70  # Distanza dal bordo dx per il punto top-right
-        
-        tl = (ROI_TL_X_OFFSET, ROI_TOP_Y)
-        bl = (0, ROI_BOTTOM_Y)
-        tr = (640 - ROI_TR_X_OFFSET, ROI_TOP_Y)
-        br = (640, ROI_BOTTOM_Y)
-
-        pts1 = np.float32([tl, bl, tr, br])
-        pts2 = np.float32([[0,0], [0,480], [640,0], [640,480]])
-        matrix = cv2.getPerspectiveTransform(pts1, pts2)
-        warped = cv2.warpPerspective(frame, matrix, (640, 480))
-
-        hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-        l_h, l_s, l_v = cv2.getTrackbarPos("L - H", "Trackbars"), cv2.getTrackbarPos("L - S", "Trackbars"), cv2.getTrackbarPos("L - V", "Trackbars")
-        u_h, u_s, u_v = cv2.getTrackbarPos("U - H", "Trackbars"), cv2.getTrackbarPos("U - S", "Trackbars"), cv2.getTrackbarPos("U - V", "Trackbars")
-        lower, upper = np.array([l_h, l_s, l_v]), np.array([u_h, u_s, u_v])
-        mask = cv2.inRange(hsv, lower, upper)
-
-        # --- LOGICA ISTOGRAMMA (invariata) ---
-        histogram = np.sum(mask[mask.shape[0]//2:, :], axis=0)
-        midpoint_hist = histogram.shape[0] // 2
-        left_half_hist = histogram[:midpoint_hist]
-        left_base_candidate = np.argmax(left_half_hist) if left_half_hist.size > 0 and np.any(left_half_hist) else 0
-        left_peak_value = np.max(left_half_hist) if left_half_hist.size > 0 and np.any(left_half_hist) else 0
-        right_half_hist = histogram[midpoint_hist:]
-        right_base_candidate = (np.argmax(right_half_hist) + midpoint_hist) if right_half_hist.size > 0 and np.any(right_half_hist) else midpoint_hist
-        right_peak_value = np.max(right_half_hist) if right_half_hist.size > 0 and np.any(right_half_hist) else 0
-        max_hist_value = np.max(histogram) if histogram.size > 0 and np.any(histogram) else 1
-        search_for_left_line = False
-        search_for_right_line = False
-        current_left_lane_base = valid_lane_center - estimated_lane_width // 2
-        current_right_lane_base = valid_lane_center + estimated_lane_width // 2
-        strong_left_peak = left_peak_value > (max_hist_value * MIN_PEAK_STRENGTH_RATIO)
-        strong_right_peak = right_peak_value > (max_hist_value * MIN_PEAK_STRENGTH_RATIO)
-
-        if strong_left_peak and strong_right_peak and \
-           abs(right_base_candidate - left_base_candidate) > MIN_SEPARATION_FOR_TWO_LINES:
-            search_for_left_line = True
-            search_for_right_line = True
-            current_left_lane_base = left_base_candidate
-            current_right_lane_base = right_base_candidate
-        elif (strong_left_peak and not strong_right_peak) or \
-             (not strong_left_peak and strong_right_peak) or \
-             (strong_left_peak and strong_right_peak and \
-              abs(right_base_candidate - left_base_candidate) <= MIN_SEPARATION_FOR_TWO_LINES):
-            single_line_pos_candidate = 0
-            if (strong_left_peak and not strong_right_peak): single_line_pos_candidate = left_base_candidate
-            elif (not strong_left_peak and strong_right_peak): single_line_pos_candidate = right_base_candidate
-            else: single_line_pos_candidate = (left_base_candidate + right_base_candidate) // 2
-            
-            reference_center = valid_lane_center
-            if single_line_pos_candidate < reference_center - LANE_SIDE_CONFIDENCE_THRESHOLD:
-                search_for_left_line = True
-                current_left_lane_base = single_line_pos_candidate
-                current_right_lane_base = current_left_lane_base + estimated_lane_width
-            elif single_line_pos_candidate > reference_center + LANE_SIDE_CONFIDENCE_THRESHOLD:
-                search_for_right_line = True
-                current_right_lane_base = single_line_pos_candidate
-                current_left_lane_base = current_right_lane_base - estimated_lane_width
-            else: # Ambigua, usa la posizione rispetto al centro del frame
-                if single_line_pos_candidate < frame_center_x:
-                    search_for_left_line = True
-                    current_left_lane_base = single_line_pos_candidate
-                    current_right_lane_base = current_left_lane_base + estimated_lane_width
-                else:
-                    search_for_right_line = True
-                    current_right_lane_base = single_line_pos_candidate
-                    current_left_lane_base = current_right_lane_base - estimated_lane_width
-        else: # Nessun picco chiaro o troppo deboli
-            search_for_left_line = True # Cerca entrambe per default
-            search_for_right_line = True
-        
-        current_left_lane_base = np.clip(current_left_lane_base, 0, warped.shape[1]-1-WINDOW_SEARCH_MARGIN) # Evita out of bounds
-        current_right_lane_base = np.clip(current_right_lane_base, WINDOW_SEARCH_MARGIN, warped.shape[1]-1) # Evita out of bounds
-        # --- FINE LOGICA ISTOGRAMMA ---
-
-        y_sliding = warped.shape[0] - 1 
-        window_height = 40
-        left_x_points, right_x_points = [], []
-        annotated_warped = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        iter_left_base = current_left_lane_base
-        iter_right_base = current_right_lane_base
-        num_windows = warped.shape[0] // window_height
-
-        for window_idx in range(num_windows):
-            win_y_high = warped.shape[0] - (window_idx * window_height)
-            win_y_low = warped.shape[0] - ((window_idx + 1) * window_height)
-            drew_left_in_this_window = False
-            drew_right_in_this_window = False
-            if search_for_left_line:
-                win_xleft_low = max(0, iter_left_base - WINDOW_SEARCH_MARGIN)
-                win_xleft_high = min(warped.shape[1], iter_left_base + WINDOW_SEARCH_MARGIN)
-                left_window_roi = mask[win_y_low:win_y_high, win_xleft_low:win_xleft_high]
-                contours_l, _ = cv2.findContours(left_window_roi, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                if contours_l:
-                    largest_l = max(contours_l, key=cv2.contourArea)
-                    if cv2.contourArea(largest_l) > MIN_CONTOUR_AREA_IN_WINDOW:
-                        M_l = cv2.moments(largest_l)
-                        if M_l["m00"] != 0:
-                            cx_l = int(M_l["m10"] / M_l["m00"])
-                            iter_left_base = win_xleft_low + cx_l
-                            left_x_points.append(iter_left_base)
-                            drew_left_in_this_window = True
-            if search_for_right_line:
-                win_xright_low = max(0, iter_right_base - WINDOW_SEARCH_MARGIN)
-                win_xright_high = min(warped.shape[1], iter_right_base + WINDOW_SEARCH_MARGIN)
-                right_window_roi = mask[win_y_low:win_y_high, win_xright_low:win_xright_high]
-                contours_r, _ = cv2.findContours(right_window_roi, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                if contours_r:
-                    largest_r = max(contours_r, key=cv2.contourArea)
-                    if cv2.contourArea(largest_r) > MIN_CONTOUR_AREA_IN_WINDOW:
-                        M_r = cv2.moments(largest_r)
-                        if M_r["m00"] != 0:
-                            cx_r = int(M_r["m10"] / M_r["m00"])
-                            iter_right_base = win_xright_low + cx_r
-                            right_x_points.append(iter_right_base)
-                            drew_right_in_this_window = True
-            annotated_warped = draw_windows(annotated_warped, win_y_low, win_y_high,
-                                            iter_left_base, iter_right_base,
-                                            draw_left_flag=drew_left_in_this_window and search_for_left_line,
-                                            draw_right_flag=drew_right_in_this_window and search_for_right_line)
-
-        new_lane_center_calculated_this_frame = False
-        current_frame_lane_center = valid_lane_center # Default al precedente valido
-        
-        if left_x_points and right_x_points:
-            left_avg = int(np.mean(left_x_points))
-            right_avg = int(np.mean(right_x_points))
-            current_detected_width = right_avg - left_avg
-            if MIN_PLAUSIBLE_LANE_WIDTH < current_detected_width < MAX_PLAUSIBLE_LANE_WIDTH:
-                current_frame_lane_center = (left_avg + right_avg) // 2
-                estimated_lane_width = int(LANE_WIDTH_SMOOTH_ALPHA * current_detected_width + \
-                                           (1 - LANE_WIDTH_SMOOTH_ALPHA) * estimated_lane_width)
-                valid_lane_center = current_frame_lane_center
-                invalid_frame_count = 0
-                new_lane_center_calculated_this_frame = True
-        elif left_x_points: # Solo linea sinistra trovata
-            left_avg = int(np.mean(left_x_points))
-            # Usa la larghezza stimata per calcolare il centro
-            if MIN_PLAUSIBLE_LANE_WIDTH < estimated_lane_width < MAX_PLAUSIBLE_LANE_WIDTH:
-                current_frame_lane_center = left_avg + estimated_lane_width // 2
-                valid_lane_center = current_frame_lane_center # Aggiorna il centro valido
-                invalid_frame_count = 0
-                new_lane_center_calculated_this_frame = True
-        elif right_x_points: # Solo linea destra trovata
-            right_avg = int(np.mean(right_x_points))
-            # Usa la larghezza stimata per calcolare il centro
-            if MIN_PLAUSIBLE_LANE_WIDTH < estimated_lane_width < MAX_PLAUSIBLE_LANE_WIDTH:
-                current_frame_lane_center = right_avg - estimated_lane_width // 2
-                valid_lane_center = current_frame_lane_center # Aggiorna il centro valido
-                invalid_frame_count = 0
-                new_lane_center_calculated_this_frame = True
-
-        if not new_lane_center_calculated_this_frame:
-            invalid_frame_count += 1
-        
-        final_lane_center = valid_lane_center # Usiamo sempre l'ultimo centro valido noto
-
-        angle = last_direction # Default all'ultimo angolo se non si fa nulla
-
-        if invalid_frame_count > MAX_INVALID_FRAMES:
-            picarx.stop() # DECOMMENTA per fermare la macchina
-            print(f"STOP: {invalid_frame_count} frame consecutivi senza rilevamento affidabile.")
-            # Potresti voler mantenere l'ultimo angolo di sterzata o raddrizzare le ruote
-            # picarx.set_dir_servo_angle(0)
-        else:
-            error = final_lane_center - frame_center_x
-            
-            # --- FASE 1: Calcolo Angolo Migliorato ---
-            raw_angle = -int(error / K_DIVISOR)
-            # Non è necessario un clip intermedio qui se K_DIVISOR è ben tunato,
-            # ma se lo vuoi, assicurati che sia ampio, es. MAX_SERVO_ANGLE * 1.2
-            # raw_angle = np.clip(raw_angle, -int(MAX_SERVO_ANGLE*1.2), int(MAX_SERVO_ANGLE*1.2))
-
-            angle = smooth_angle_func(raw_angle, last_direction, ALPHA_SMOOTHING)
-            angle = np.clip(angle, -MAX_SERVO_ANGLE, MAX_SERVO_ANGLE)
-            last_direction = angle
-            # --- FINE FASE 1 ---
-
-            current_speed_to_set = MAX_SPEED # Default speed
-
-            if ENABLE_DYNAMIC_SPEED:
-                # --- FASE 2: Controllo Velocità Dinamico ---
-                abs_angle = abs(angle)
-                if abs_angle > SPEED_REDUCTION_THRESHOLD_ANGLE:
-                    reduction_range = MAX_SERVO_ANGLE - SPEED_REDUCTION_THRESHOLD_ANGLE
-                    if reduction_range <=0: reduction_range = MAX_SERVO_ANGLE # Evita divisione per zero
-                    
-                    overshoot_angle = abs_angle - SPEED_REDUCTION_THRESHOLD_ANGLE
-                    speed_factor = max(0, 1 - (overshoot_angle / reduction_range))
-                    current_speed_to_set = MIN_SPEED + (MAX_SPEED - MIN_SPEED) * speed_factor
-                    current_speed_to_set = int(np.clip(current_speed_to_set, MIN_SPEED, MAX_SPEED))
-                else:
-                    current_speed_to_set = MAX_SPEED
-                # --- FINE FASE 2 ---
-            
-            # print(f"L:{len(left_x_points)} R:{len(right_x_points)} Err:{error} RawAng:{raw_angle} SmAng:{angle} Spd:{current_speed_to_set}")
-            
-            # QUI implementeresti la FASE 3 (controllo differenziale) se volessi
-            # al posto di picarx.forward()
-            # Per ora usiamo Fase 1 e 2:
-            picarx.forward(current_speed_to_set) # DECOMMENTA
-            picarx.set_dir_servo_angle(-angle)   # DECOMMENTA
-
-        # Annotazioni
-        cv2.line(annotated_warped, (final_lane_center, 0), (final_lane_center, warped.shape[0]), (0,255,255), 2)
-        cv2.line(annotated_warped, (frame_center_x, 0), (frame_center_x, warped.shape[0]), (255,255,255), 1)
-        # Mostra l'angolo che viene effettivamente inviato al servo (con il segno invertito)
-        cv2.putText(annotated_warped, f"Servo Angle: {-angle}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-        cv2.putText(annotated_warped, f"L_pts: {len(left_x_points)} R_pts: {len(right_x_points)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1)
-        cv2.putText(annotated_warped, f"Est.W: {estimated_lane_width:.0f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1)
-        if ENABLE_DYNAMIC_SPEED and not (invalid_frame_count > MAX_INVALID_FRAMES) :
-             cv2.putText(annotated_warped, f"Speed: {current_speed_to_set}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-
-
-        cv2.imshow("Annotated Warped", annotated_warped)
-        # cv2.imshow("Original Frame", frame) # Utile per calibrare la prospettiva
-        # cv2.imshow("Mask", mask)
-
-        if cv2.waitKey(1) == 27: # ESC per uscire
-            break
-        
-        # time.sleep(0.01) # Riduci o rimuovi se il processing è già abbastanza lento
-
-finally:
-    print("Uscita dal programma...")
-    picarx.stop() # DECOMMENTA
+def cleanup():
+    """Pulizia risorse al termine"""
+    global running
+    running = False
+    px.forward(0)  # ferma il veicolo
+    px.set_dir_servo_angle(0)  # centra il servo
     picam2.stop()
     cv2.destroyAllWindows()
+    print("Cleanup completato")
+
+def apply_steering_to_picarx(steering_angle_deg):
+    """Applica l'angolo di sterzo al PicarX"""
+    # Converte l'angolo di sterzo in angolo servo
+    servo_angle = steering_angle_deg * STEERING_MULTIPLIER
+    servo_angle = np.clip(servo_angle, -45, 45)
+    
+    # Applica al servo di direzione
+    px.set_dir_servo_angle(servo_angle)
+
+def average_line(lines, side, width, height):
+    """Calcola la linea media data una lista di segmenti"""
+    if len(lines) == 0:
+        # default line se non ne trova
+        if side == 'left':
+            return (0, height, width // 3, int(height * 0.2))
+        else:
+            return (width, height, (2 * width) // 3, int(height * 0.2))
+
+    xs, ys = [], []
+    for x1, y1, x2, y2 in lines:
+        xs += [x1, x2]
+        ys += [y1, y2]
+    
+    # Verifica che abbiamo abbastanza punti
+    if len(xs) < 2:
+        if side == 'left':
+            return (0, height, width // 3, int(height * 0.2))
+        else:
+            return (width, height, (2 * width) // 3, int(height * 0.2))
+    
+    m, b = np.polyfit(ys, xs, 1)
+    y1, y2 = height, int(height * 0.2)
+    x1 = int(m * y1 + b)
+    x2 = int(m * y2 + b)
+    return (x1, y1, x2, y2)
+
+def draw_steering_trajectory(img, steering_angle_deg):
+    """Disegna la traiettoria prevista sul frame"""
+    h, w = img.shape[:2]
+    cx, cy = w // 2, h - 30
+    L = 100
+    rad = np.radians(-steering_angle_deg)
+    ex = int(cx + L * np.sin(rad))
+    ey = int(cy - L * np.cos(rad))
+    
+    # Colore in base all'angolo
+    if abs(steering_angle_deg) < 15:
+        color = (0, 255, 0)  # Verde: tutto ok
+    elif abs(steering_angle_deg) < 30:
+        color = (0, 165, 255)  # Arancione: attenzione
+    else:
+        color = (0, 0, 255)  # Rosso: curva stretta
+    
+    cv2.arrowedLine(img, (cx, cy), (ex, ey), color, 4)
+    cv2.putText(img, f"Steering: {steering_angle_deg:.1f}Â°", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+def process_frame():
+    
+    global BASE_SPEED
+    
+    """Processa un singolo frame dalla camera"""
+    global previous_steering_angle, ignored_count
+    
+    # Cattura frame dalla Picamera2
+    frame = picam2.capture_array()
+    
+    if frame is None:
+        return False
+    
+    h, w = frame.shape[:2]
+    roi_top, roi_bot = int(h * 0.6), h-50 
+
+    # Prepara overlay semitrasparente per info
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, roi_top), (w, roi_bot), (0, 0, 0), -1)
+    info_overlay = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
+
+    # Bird's Eye View per calcolo carreggiata
+    src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bot], [0, roi_bot]])
+    dst = np.float32([[0, 0], [300, 0], [300, 200], [0, 200]])
+    bev = cv2.warpPerspective(frame, cv2.getPerspectiveTransform(src, dst), (300, 200))
+
+    # Segmentazione colori e rilevamento bordi
+    hls = cv2.cvtColor(bev, cv2.COLOR_BGR2HLS)
+    # Maschera per linee gialle
+    ym = cv2.inRange(hls, np.array([15, 40, 100]), np.array([35, 255, 255]))
+    # Maschera per linee bianche
+    wm = cv2.inRange(hls, np.array([0, 200, 0]), np.array([180, 255, 255]))
+    
+    mask = cv2.morphologyEx(cv2.bitwise_or(ym, wm), cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+    edges = cv2.Canny(mask, 50, 150)
+    
+    # Rilevamento linee con Hough Transform
+    raw_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 30, minLineLength=15, maxLineGap=20)
+
+    # Separa segmenti sinistri e destri
+    left_ls, right_ls = [], []
+    if raw_lines is not None:
+        for l in raw_lines:
+            x1, y1, x2, y2 = l[0]
+            if x2 - x1 == 0:  # Evita divisione per zero
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            if abs(slope) < 0.6:  # Ignora linee troppo orizzontali
+                continue
+            (left_ls if slope < 0 else right_ls).append((x1, y1, x2, y2))
+
+    # Calcola linee medie
+    left_line  = average_line(left_ls,  'left',  bev.shape[1], bev.shape[0])
+    right_line = average_line(right_ls, 'right', bev.shape[1], bev.shape[0])
+    lx1, ly1, lx2, ly2 = left_line
+    rx1, ry1, rx2, ry2 = right_line
+    lv, rv = bool(left_ls), bool(right_ls)  # linee valide
+
+    # Calcola base X di ciascuna linea
+    base_y = bev.shape[0] - 1
+    lx_base = int(np.interp(base_y, [ly2, ly1], [lx2, lx1])) if lv else 0
+    rx_base = int(np.interp(base_y, [ry2, ry1], [rx2, rx1])) if rv else bev.shape[1] - 1
+    lane_width = abs(rx_base - lx_base)
+
+    # Verifiche per ignorare il frame
+    ignored_reasons = []
+    if lv and rv and lane_width < MIN_LANE_WIDTH:
+        ignored_reasons.append("Carreggiata troppo piccola")
+    
+    center_x = bev.shape[1] // 2
+    if (lv and abs(lx_base - center_x) < MIN_CENTER_DISTANCE) or \
+       (rv and abs(rx_base - center_x) < MIN_CENTER_DISTANCE):
+        ignored_reasons.append("Linea vicina al centro")
+
+    # Calcola angolo di sterzo
+    if ignored_reasons:
+        steering_angle = previous_steering_angle
+        print(f"Frame ignorato: {', '.join(ignored_reasons)}")
+    else:
+        if lv and rv:
+            # Entrambe le linee visibili: va dritto
+            steering_angle = 0.0
+        elif lv or rv:
+            # Solo una linea visibile: segui quella linea
+            OFFSET_PX = 10 # offset laterale desiderato
+
+            if lv or rv:
+                if lv:
+                    # Calcolo offset rispetto alla linea sinistra
+                    base_x = int(np.interp(bev.shape[0] - 1, [ly2, ly1], [lx2, lx1]))
+                    offset_target = base_x + OFFSET_PX
+                else:
+                    # Calcolo offset rispetto alla linea destra
+                    base_x = int(np.interp(bev.shape[0] - 1, [ry2, ry1], [rx2, rx1]))
+                    offset_target = base_x - OFFSET_PX
+
+                # Calcolo deviazione da centro del BEV
+                center_x = bev.shape[1] // 2
+                dx = offset_target - center_x
+
+                # Normalizza e mappa in angolo di sterzo
+                steering_angle = -np.clip(dx / center_x, -1.0, 1.0) * MAX_STEERING_ANGLE
+
+        else:
+            # Nessuna linea: mantieni direzione precedente
+            steering_angle = previous_steering_angle
+
+    # Smoothing per evitare movimenti bruschi
+    if abs(steering_angle - previous_steering_angle) > 20:
+        steering_angle = previous_steering_angle + np.sign(steering_angle - previous_steering_angle) * 10
+    
+    previous_steering_angle = steering_angle
+
+    # Applica sterzo al PicarX
+    apply_steering_to_picarx(steering_angle)
+
+    # Visualizzazione risultati
+    # Disegna linee e area carreggiata sul frame originale
+    invM = cv2.getPerspectiveTransform(dst, src)
+    pts = np.array([[lx1, ly1], [lx2, ly2], [rx2, ry2], [rx1, ry1]], dtype=np.float32).reshape(-1,1,2)
+    pts_orig = cv2.perspectiveTransform(pts, invM).reshape(-1,2)
+    l1, l2, r2, r1 = pts_orig
+    
+    # Disegna linee
+    cv2.line(frame, tuple(l1.astype(int)), tuple(l2.astype(int)), (255,0,0), 4)  # Sinistra: blu
+    cv2.line(frame, tuple(r1.astype(int)), tuple(r2.astype(int)), (0,0,255), 4)  # Destra: rosso
+    
+    # Disegna area carreggiata (overlay verde semitrasparente)
+    overlay_lane = frame.copy()
+    cv2.fillPoly(overlay_lane, [np.array([l1, l2, r2, r1], dtype=np.int32)], (0,255,0))
+    frame = cv2.addWeighted(overlay_lane, 0.3, frame, 0.7, 0)
+
+    # Aggiunge informazioni testuali
+    cv2.putText(frame, f"Larghezza: {lane_width}px", (10, h-100), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    cv2.putText(frame, f"Velocita: {BASE_SPEED}px/s", (10, h-130), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    
+    if ignored_reasons:
+        text = ", ".join(ignored_reasons)
+        cv2.putText(frame, f"Ignorato: {text}", (10, h-70), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+    
+    # Disegna traiettoria di sterzo
+    draw_steering_trajectory(frame, -steering_angle)
+
+    # Salva frame ignorati per debug
+    if ignored_reasons:
+        ignored_count += 1
+        filename = f"frame_ignored_{ignored_count}_{int(time.time()*1000)}.png"
+        #cv2.imwrite(os.path.join(OUTPUT_DIR, filename), frame)
+
+    # Mostra video (opzionale, commenta se non hai display)
+    try:
+        cv2.imshow("Camera View", frame)
+        cv2.imshow("BEV View", bev)
+        cv2.imshow("Edges", edges)
+        cv2.imshow("Mask", mask)
+        
+        # Controlla input tastiera per uscita
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            return False
+        elif key == ord(' '):  # Spazio per pausa
+            BASE_SPEED = 0
+            px.forward(BASE_SPEED)
+        elif key == ord('.'):
+            BASE_SPEED = 1
+            px.forward(BASE_SPEED)
+    except:
+        # Se non c'Ã¨ display, ignora gli errori di visualizzazione
+        pass
+    
+    return True
+
+def main():
+    """Funzione principale"""
+    print("Avvio sistema di lane detection...")
+    print("Premi 'q' per uscire, 'spazio' per pausa")
+    
+    try:
+        # Loop principale
+        while running:
+            if not process_frame():
+                break
+            
+            # Piccola pausa per non sovraccaricare il sistema
+            time.sleep(0.05)  # ~30 FPS
+            
+    except KeyboardInterrupt:
+        print("\nInterruzione da tastiera")
+    except Exception as e:
+        print(f"Errore: {e}")
+    finally:
+        cleanup()
+
+if __name__ == "__main__":
+    main()
