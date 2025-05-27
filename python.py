@@ -4,7 +4,6 @@ import os
 import time
 from picamera2 import Picamera2
 from picarx import Picarx
-from robot_hat import Music, TTS
 
 # Costanti per simulazione
 MAX_STEERING_ANGLE    = 45    # gradi
@@ -17,6 +16,10 @@ OUTPUT_DIR            = "./ignored_frames"
 BASE_SPEED           = 0     # velocità base del veicolo
 STEERING_MULTIPLIER  = 10      # moltiplicatore per conversione angolo->servo
 
+# NUOVE COSTANTI PER SMOOTH STEERING
+SMOOTHING_FACTOR     = 0.3    # Range consigliato: 0.1-0.5 (più basso = più smooth, più alto = più reattivo)
+MAX_STEERING_CHANGE  = 8.0    # gradi, massimo cambio di sterzo per frame (range: 5-15°)
+
 # Setup directories
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -24,13 +27,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 print("Inizializzazione PicarX...")
 px = Picarx()
 px.forward(0)  # ferma il veicolo all'avvio
-
-# Inizializzazione Audio
-print("Inizializzazione sistema audio...")
-music = Music()
-tts = TTS()
-music.music_set_volume(20)
-tts.lang("en-US")
 
 # Inizializzazione Picamera2
 print("Inizializzazione Picamera2...")
@@ -48,7 +44,6 @@ picam2.start()
 previous_steering_angle = 0.0
 ignored_count = 0
 running = True
-flag_bgm = False
 
 def cleanup():
     """Pulizia risorse al termine"""
@@ -56,10 +51,28 @@ def cleanup():
     running = False
     px.forward(0)  # ferma il veicolo
     px.set_dir_servo_angle(0)  # centra il servo
-    music.music_stop()  # ferma la musica
     picam2.stop()
     cv2.destroyAllWindows()
     print("Cleanup completato")
+
+def apply_smooth_steering(target_angle):
+    """Applica uno smoothing progressivo all'angolo di sterzo"""
+    global previous_steering_angle
+    
+    # Calcola la differenza tra angolo target e precedente
+    angle_diff = target_angle - previous_steering_angle
+    
+    # Limita il cambio massimo per frame
+    if abs(angle_diff) > MAX_STEERING_CHANGE:
+        angle_diff = np.sign(angle_diff) * MAX_STEERING_CHANGE
+    
+    # Applica smoothing usando media pesata
+    smooth_angle = previous_steering_angle + (angle_diff * SMOOTHING_FACTOR)
+    
+    # Aggiorna l'angolo precedente
+    previous_steering_angle = smooth_angle
+    
+    return smooth_angle
 
 def apply_steering_to_picarx(steering_angle_deg):
     """Applica l'angolo di sterzo al PicarX"""
@@ -69,6 +82,24 @@ def apply_steering_to_picarx(steering_angle_deg):
     
     # Applica al servo di direzione
     px.set_dir_servo_angle(servo_angle)
+
+def calculate_lane_center(left_line, right_line, bev_shape):
+    """Calcola il centro della carreggiata dalla base delle linee"""
+    h, w = bev_shape[:2]
+    base_y = h - 1  # Linea di base (bottom del BEV)
+    
+    # Estrae coordinate delle linee
+    lx1, ly1, lx2, ly2 = left_line
+    rx1, ry1, rx2, ry2 = right_line
+    
+    # Calcola X alla base per entrambe le linee
+    left_x_base = int(np.interp(base_y, [ly2, ly1], [lx2, lx1]))
+    right_x_base = int(np.interp(base_y, [ry2, ry1], [rx2, rx1]))
+    
+    # Centro della carreggiata
+    lane_center_x = (left_x_base + right_x_base) // 2
+    
+    return lane_center_x, left_x_base, right_x_base
 
 def average_line(lines, side, width, height):
     """Calcola la linea media data una lista di segmenti"""
@@ -118,52 +149,12 @@ def draw_steering_trajectory(img, steering_angle_deg):
     cv2.putText(img, f"Steering: {steering_angle_deg:.1f}°", (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-def handle_key_input(key):
-    """Gestisce l'input da tastiera per il controllo audio e movimento"""
-    global BASE_SPEED, flag_bgm
-    
-    if key == ord('q'):
-        return False  # Esce dal programma
-    elif key == ord(' '):  # Spazio per suonare il clacson e fermare
-        music.sound_play('./sound.wav')
-        BASE_SPEED = 0
-        px.forward(BASE_SPEED)
-        print("Clacson suonato - Veicolo fermato")
-    elif key == ord('h'):  # 'h' per suonare clacson con thread (non blocca)
-        music.sound_play_threading('./sound.wav')
-        print("Clacson suonato (thread)")
-    elif key == ord('s'):  # 's' per avviare/fermare il veicolo
-        if BASE_SPEED == 0:
-            BASE_SPEED = 1
-            px.forward(BASE_SPEED)
-            print("Veicolo avviato")
-        else:
-            BASE_SPEED = 0
-            px.forward(BASE_SPEED)
-            print("Veicolo fermato")
-    elif key == ord('m'):  # 'm' per musica di sottofondo
-        flag_bgm = not flag_bgm
-        if flag_bgm:
-            # Modifica il percorso della musica secondo le tue necessità
-            music.music_play('./background_music.mp3')
-            print("Musica di sottofondo avviata")
-        else:
-            music.music_stop()
-            print("Musica di sottofondo fermata")
-    elif key == ord('t'):  # 't' per text-to-speech
-        words = "Lane detection active"
-        tts.say(words)
-        print("TTS: Lane detection active")
-    elif key == ord('w'):  # 'w' per avvertimento vocale
-        words = "Warning, obstacle detected"  
-        tts.say(words)
-        print("TTS: Warning message")
-    
-    return True
-
 def process_frame():
+    
+    global BASE_SPEED
+    
     """Processa un singolo frame dalla camera"""
-    global BASE_SPEED, previous_steering_angle, ignored_count
+    global previous_steering_angle, ignored_count
     
     # Cattura frame dalla Picamera2
     frame = picam2.capture_array()
@@ -232,49 +223,55 @@ def process_frame():
        (rv and abs(rx_base - center_x) < MIN_CENTER_DISTANCE):
         ignored_reasons.append("Linea vicina al centro")
 
-    # Calcola angolo di sterzo
+    # Calcola angolo di sterzo TARGET (prima dello smoothing)
+    target_steering_angle = 0.0
+    
     if ignored_reasons:
-        steering_angle = previous_steering_angle
+        target_steering_angle = previous_steering_angle
         print(f"Frame ignorato: {', '.join(ignored_reasons)}")
-        # Suona un avvertimento quando viene ignorato un frame
-        music.sound_play_threading('./sound.wav')
     else:
         if lv and rv:
-            # Entrambe le linee visibili: va dritto
-            steering_angle = 0.0
+            # ENTRAMBE LE LINEE VISIBILI: CENTRA IL VEICOLO
+            lane_center_x, left_x_base, right_x_base = calculate_lane_center(left_line, right_line, bev.shape)
+            
+            # Calcola deviazione dal centro del BEV
+            bev_center_x = bev.shape[1] // 2
+            deviation = lane_center_x - bev_center_x
+            
+            # Normalizza e converte in angolo di sterzo
+            max_deviation = bev.shape[1] // 4  # massima deviazione accettabile
+            normalized_deviation = np.clip(deviation / max_deviation, -1.0, 1.0)
+            target_steering_angle = -normalized_deviation * MAX_STEERING_ANGLE * 0.5  # fattore ridotto per rettilinei
+            
         elif lv or rv:
-            # Solo una linea visibile: segui quella linea
+            # Solo una linea visibile: segui quella linea con offset
             OFFSET_PX = 20 # offset laterale desiderato
 
-            if lv or rv:
-                if lv:
-                    # Calcolo offset rispetto alla linea sinistra
-                    base_x = int(np.interp(bev.shape[0] - 1, [ly2, ly1], [lx2, lx1]))
-                    offset_target = base_x + OFFSET_PX
-                else:
-                    # Calcolo offset rispetto alla linea destra
-                    base_x = int(np.interp(bev.shape[0] - 1, [ry2, ry1], [rx2, rx1]))
-                    offset_target = base_x - OFFSET_PX
+            if lv:
+                # Calcolo offset rispetto alla linea sinistra
+                base_x = int(np.interp(bev.shape[0] - 1, [ly2, ly1], [lx2, lx1]))
+                offset_target = base_x + OFFSET_PX
+            else:
+                # Calcolo offset rispetto alla linea destra
+                base_x = int(np.interp(bev.shape[0] - 1, [ry2, ry1], [rx2, rx1]))
+                offset_target = base_x - OFFSET_PX
 
-                # Calcolo deviazione da centro del BEV
-                center_x = bev.shape[1] // 2
-                dx = offset_target - center_x
+            # Calcolo deviazione da centro del BEV
+            center_x = bev.shape[1] // 2
+            dx = offset_target - center_x
 
-                # Normalizza e mappa in angolo di sterzo
-                steering_angle = -np.clip(dx / center_x, -1.0, 1.0) * MAX_STEERING_ANGLE
+            # Normalizza e mappa in angolo di sterzo
+            target_steering_angle = -np.clip(dx / center_x, -1.0, 1.0) * MAX_STEERING_ANGLE
 
         else:
             # Nessuna linea: mantieni direzione precedente
-            steering_angle = previous_steering_angle
+            target_steering_angle = previous_steering_angle
 
-    # Smoothing per evitare movimenti bruschi
-    if abs(steering_angle - previous_steering_angle) > 20:
-        steering_angle = previous_steering_angle + np.sign(steering_angle - previous_steering_angle) * 10
-    
-    previous_steering_angle = steering_angle
+    # APPLICA SMOOTHING ALLA STERZATA
+    smooth_steering_angle = apply_smooth_steering(target_steering_angle)
 
     # Applica sterzo al PicarX
-    apply_steering_to_picarx(steering_angle)
+    apply_steering_to_picarx(smooth_steering_angle)
 
     # Visualizzazione risultati
     # Disegna linee e area carreggiata sul frame originale
@@ -292,24 +289,31 @@ def process_frame():
     cv2.fillPoly(overlay_lane, [np.array([l1, l2, r2, r1], dtype=np.int32)], (0,255,0))
     frame = cv2.addWeighted(overlay_lane, 0.3, frame, 0.7, 0)
 
+    # Disegna il centro della carreggiata se entrambe le linee sono visibili
+    if lv and rv and not ignored_reasons:
+        lane_center_x, _, _ = calculate_lane_center(left_line, right_line, bev.shape)
+        # Trasforma il punto del centro dal BEV al frame originale
+        center_bev = np.array([[lane_center_x, bev.shape[0]-1]], dtype=np.float32).reshape(-1,1,2)
+        center_orig = cv2.perspectiveTransform(center_bev, invM).reshape(-1,2)[0]
+        cv2.circle(frame, tuple(center_orig.astype(int)), 8, (255,255,0), -1)  # Cerchio giallo per il centro
+
     # Aggiunge informazioni testuali
-    cv2.putText(frame, f"Larghezza: {lane_width}px", (10, h-100), 
+    cv2.putText(frame, f"Larghezza: {lane_width}px", (10, h-130), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-    cv2.putText(frame, f"Velocita: {BASE_SPEED}px/s", (10, h-130), 
+    cv2.putText(frame, f"Velocita: {BASE_SPEED}px/s", (10, h-160), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-    
-    # Mostra lo stato della musica
-    music_status = "ON" if flag_bgm else "OFF"
-    cv2.putText(frame, f"BGM: {music_status}", (10, h-160), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    cv2.putText(frame, f"Smooth Factor: {SMOOTHING_FACTOR:.1f}", (10, h-100), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+    cv2.putText(frame, f"Target: {target_steering_angle:.1f}° | Smooth: {smooth_steering_angle:.1f}°", (10, h-70), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
     
     if ignored_reasons:
         text = ", ".join(ignored_reasons)
-        cv2.putText(frame, f"Ignorato: {text}", (10, h-70), 
+        cv2.putText(frame, f"Ignorato: {text}", (10, h-40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
     
-    # Disegna traiettoria di sterzo
-    draw_steering_trajectory(frame, -steering_angle)
+    # Disegna traiettoria di sterzo (usa l'angolo smooth)
+    draw_steering_trajectory(frame, -smooth_steering_angle)
 
     # Salva frame ignorati per debug
     if ignored_reasons:
@@ -324,36 +328,28 @@ def process_frame():
         cv2.imshow("Edges", edges)
         cv2.imshow("Mask", mask)
         
-        # Controlla input tastiera
+        # Controlla input tastiera per uscita
         key = cv2.waitKey(1) & 0xFF
-        if key != 255:  # Se è stato premuto un tasto
-            return handle_key_input(key)
-            
+        if key == ord('q'):
+            return False
+        elif key == ord(' '):  # Spazio per pausa
+            BASE_SPEED = 0
+            px.forward(BASE_SPEED)
+        elif key == ord('.'):
+            BASE_SPEED = 1
+            px.forward(BASE_SPEED)
     except:
         # Se non c'è display, ignora gli errori di visualizzazione
         pass
     
     return True
 
-def print_controls():
-    """Stampa i controlli disponibili"""
-    controls = """
-=== CONTROLLI DISPONIBILI ===
-q: Exit del programma
-SPAZIO: Suona clacson + ferma veicolo
-h: Suona clacson (con thread, non blocca)
-s: Start/Stop veicolo
-m: Musica di sottofondo ON/OFF
-t: Text-to-Speech status
-w: Avvertimento vocale
-============================
-"""
-    print(controls)
-
 def main():
     """Funzione principale"""
-    print("Avvio sistema di lane detection con controlli audio...")
-    print_controls()
+    print("Avvio sistema di lane detection...")
+    print("Premi 'q' per uscire, 'spazio' per pausa")
+    print(f"Smoothing Factor: {SMOOTHING_FACTOR} (range consigliato: 0.1-0.5)")
+    print(f"Max Steering Change: {MAX_STEERING_CHANGE}° (range consigliato: 5-15°)")
     
     try:
         # Loop principale
