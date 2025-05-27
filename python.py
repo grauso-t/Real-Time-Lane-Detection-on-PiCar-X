@@ -12,6 +12,11 @@ MIN_LANE_WIDTH        = 120   # px, soglia per carreggiata piccola
 MIN_CENTER_DISTANCE   = 30    # px, soglia distanza minima linea-centro
 OUTPUT_DIR            = "./ignored_frames"
 
+# Costanti per smoothing dello sterzo
+STEERING_SMOOTHING_FACTOR = 0.3   # Fattore di smoothing (0.1 = molto lento, 1.0 = immediato)
+MAX_STEERING_CHANGE = 5           # Massimo cambiamento di sterzo per frame (gradi)
+STEERING_DEADZONE = 2             # Zona morta per piccole correzioni (gradi)
+
 # Costanti per PicarX
 BASE_SPEED           = 0     # velocità base del veicolo
 STEERING_MULTIPLIER  = 10      # moltiplicatore per conversione angolo->servo
@@ -57,7 +62,28 @@ def cleanup():
     cv2.destroyAllWindows()
     print("Cleanup completato")
 
-def apply_steering_to_picarx(steering_angle_deg):
+def smooth_steering_angle(target_angle, previous_angle):
+    """Applica smoothing graduale all'angolo di sterzo"""
+    
+    # Calcola la differenza tra target e angolo precedente
+    angle_diff = target_angle - previous_angle
+    
+    # Applica zona morta per evitare micro-correzioni
+    if abs(angle_diff) < STEERING_DEADZONE:
+        return previous_angle
+    
+    # Limita il cambiamento massimo per frame
+    if abs(angle_diff) > MAX_STEERING_CHANGE:
+        angle_diff = np.sign(angle_diff) * MAX_STEERING_CHANGE
+    
+    # Applica smoothing esponenziale
+    smoothed_change = angle_diff * STEERING_SMOOTHING_FACTOR
+    new_angle = previous_angle + smoothed_change
+    
+    # Clamp finale per sicurezza
+    new_angle = np.clip(new_angle, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE)
+    
+    return new_angle
     """Applica l'angolo di sterzo al PicarX"""
     # Converte l'angolo di sterzo in angolo servo
     servo_angle = steering_angle_deg * STEERING_MULTIPLIER
@@ -321,14 +347,13 @@ def process_frame():
     deviation = target_x - bev_center
     
     if ignored_reasons and not last_valid_lane:
-        steering_angle = previous_steering_angle
+        target_steering_angle = previous_steering_angle
     else:
         # Normalizza e mappa in angolo di sterzo
-        steering_angle = -np.clip(deviation / bev_center, -1.0, 1.0) * MAX_STEERING_ANGLE
+        target_steering_angle = -np.clip(deviation / bev_center, -1.0, 1.0) * MAX_STEERING_ANGLE
 
-    # Smoothing per evitare movimenti bruschi
-    if abs(steering_angle - previous_steering_angle) > 20:
-        steering_angle = previous_steering_angle + np.sign(steering_angle - previous_steering_angle) * 10
+    # Applica smoothing graduale per sterzate più dolci
+    steering_angle = smooth_steering_angle(target_steering_angle, previous_steering_angle)
     
     previous_steering_angle = steering_angle
 
@@ -365,12 +390,14 @@ def process_frame():
     frame = draw_center_and_target(frame, lane_center, target_x, invM, bev.shape)
 
     # Aggiunge informazioni testuali
-    cv2.putText(frame, f"Larghezza: {lane_width}px", (10, h-100), 
+    cv2.putText(frame, f"Larghezza: {lane_width}px", (10, h-130), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-    cv2.putText(frame, f"Velocita: {BASE_SPEED}px/s", (10, h-130), 
+    cv2.putText(frame, f"Velocita: {BASE_SPEED}px/s", (10, h-160), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-    cv2.putText(frame, f"Offset: {offset}px", (10, h-160), 
+    cv2.putText(frame, f"Offset: {offset}px", (10, h-190), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    cv2.putText(frame, f"Target: {target_steering_angle:.1f}° -> Smooth: {steering_angle:.1f}°", (10, h-100), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
     
     if ignored_reasons:
         text = ", ".join(ignored_reasons)
