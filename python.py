@@ -5,6 +5,9 @@ import time
 from picamera2 import Picamera2
 from picarx import Picarx
 
+from time import sleep
+from robot_hat import Music,TTS
+
 # Costanti per simulazione
 MAX_STEERING_ANGLE    = 45    # gradi
 STEERING_AGGRESSION   = 1
@@ -39,6 +42,11 @@ config = picam2.create_preview_configuration(
 )
 picam2.configure(config)
 picam2.start()
+
+music = Music()
+
+flag_bgm = False
+music.music_set_volume(20)
 
 # Variabili globali
 previous_steering_angle = 0.0
@@ -321,6 +329,8 @@ def process_frame():
         filename = f"frame_ignored_{ignored_count}_{int(time.time()*1000)}.png"
         #cv2.imwrite(os.path.join(OUTPUT_DIR, filename), frame)
 
+    global flag_bgm
+
     # Mostra video (opzionale, commenta se non hai display)
     try:
         cv2.imshow("Camera View", frame)
@@ -338,6 +348,14 @@ def process_frame():
         elif key == ord('.'):
             BASE_SPEED = 1
             px.forward(BASE_SPEED)
+        elif key == ord('m'):
+            flag_bgm = not flag_bgm
+            if flag_bgm:
+                print("Musica di sottofondo attivata")
+                music.sound_play_threading("sound.wav")
+            else:
+                print("Musica di sottofondo disattivata")
+                music.music_stop()
     except:
         # Se non c'è display, ignora gli errori di visualizzazione
         pass
