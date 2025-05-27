@@ -6,7 +6,7 @@ from picamera2 import Picamera2
 from picarx import Picarx
 
 from time import sleep
-from robot_hat import Music,TTS
+from robot_hat import Music
 
 # Costanti per simulazione
 MAX_STEERING_ANGLE    = 45    # gradi
