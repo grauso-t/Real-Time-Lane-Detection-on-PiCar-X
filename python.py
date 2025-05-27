@@ -7,14 +7,14 @@ from picarx import Picarx
 
 # Costanti per controllo sterzo
 MAX_STEERING_ANGLE    = 30    # Ridotto da 45 per evitare sterzate eccessive
-STEERING_AGGRESSION   = 0.7   # Fattore di aggressività (0.5-1.0)
+STEERING_AGGRESSION   = 0.7   # Fattore di aggressivitÃ  (0.5-1.0)
 MIN_LANE_WIDTH        = 120   # px, soglia per carreggiata piccola
 MIN_CENTER_DISTANCE   = 30    # px, soglia distanza minima linea-centro
 OUTPUT_DIR            = "./ignored_frames"
 
 # Costanti per PicarX
-BASE_SPEED           = 0      # velocità base del veicolo
-STEERING_MULTIPLIER  = 1.0    # Ridotto per conversione più delicata
+BASE_SPEED           = 0      # velocitÃ  base del veicolo
+STEERING_MULTIPLIER  = 1.0    # Ridotto per conversione piÃ¹ delicata
 
 # Costanti per controllo posizione
 DESIRED_OFFSET       = 20     # px, offset desiderato dalle linee
@@ -60,7 +60,7 @@ def apply_steering_to_picarx(steering_angle_deg):
     # Limita l'angolo prima della conversione
     steering_angle_deg = np.clip(steering_angle_deg, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE)
     
-    # Converte l'angolo di sterzo in angolo servo con mapping più delicato
+    # Converte l'angolo di sterzo in angolo servo con mapping piÃ¹ delicato
     servo_angle = steering_angle_deg * STEERING_MULTIPLIER
     servo_angle = np.clip(servo_angle, -30, 30)  # Limita ulteriormente per sicurezza
     
@@ -114,7 +114,7 @@ def calculate_steering_angle(left_line, right_line, left_valid, right_valid, bev
         # Entrambe le linee visibili: calcola il centro della carreggiata
         lane_center = (left_base_x + right_base_x) // 2
         
-        # Verifica se siamo già abbastanza centrati
+        # Verifica se siamo giÃ  abbastanza centrati
         if abs(lane_center - center_x) <= LANE_CENTER_TOLERANCE:
             return 0.0  # Mantieni direzione dritta
         
@@ -140,7 +140,7 @@ def calculate_steering_angle(left_line, right_line, left_valid, right_valid, bev
     max_deviation = bev_width // 2
     normalized_deviation = np.clip(deviation / max_deviation, -1.0, 1.0)
     
-    # Applica aggressività e calcola angolo finale
+    # Applica aggressivitÃ  e calcola angolo finale
     steering_angle = -normalized_deviation * MAX_STEERING_ANGLE * STEERING_AGGRESSION
     
     return steering_angle
@@ -163,7 +163,7 @@ def draw_steering_trajectory(img, steering_angle_deg):
         color = (0, 0, 255)  # Rosso: curva stretta
     
     cv2.arrowedLine(img, (cx, cy), (ex, ey), color, 4)
-    cv2.putText(img, f"Steering: {steering_angle_deg:.1f}°", (10, 50),
+    cv2.putText(img, f"Steering: {steering_angle_deg:.1f}Â°", (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 def process_frame():
@@ -319,7 +319,7 @@ def process_frame():
             BASE_SPEED = 1
             px.forward(BASE_SPEED)
     except:
-        # Se non c'è display, ignora gli errori di visualizzazione
+        # Se non c'Ã¨ display, ignora gli errori di visualizzazione
         pass
     
     return True
