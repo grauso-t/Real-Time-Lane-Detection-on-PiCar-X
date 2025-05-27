@@ -5,20 +5,16 @@ import time
 from picamera2 import Picamera2
 from picarx import Picarx
 
-# Costanti per controllo sterzo
-MAX_STEERING_ANGLE    = 30    # Ridotto da 45 per evitare sterzate eccessive
-STEERING_AGGRESSION   = 0.7   # Fattore di aggressivitÃƒÂ  (0.5-1.0)
+# Costanti per simulazione
+MAX_STEERING_ANGLE    = 45    # gradi
+STEERING_AGGRESSION   = 1
 MIN_LANE_WIDTH        = 120   # px, soglia per carreggiata piccola
 MIN_CENTER_DISTANCE   = 30    # px, soglia distanza minima linea-centro
 OUTPUT_DIR            = "./ignored_frames"
 
 # Costanti per PicarX
-BASE_SPEED           = 0      # velocitÃƒÂ  base del veicolo
-STEERING_MULTIPLIER  = 1.0    # Ridotto per conversione piÃƒÂ¹ delicata
-
-# Costanti per controllo posizione
-DESIRED_OFFSET       = 20     # px, offset desiderato dalle linee
-LANE_CENTER_TOLERANCE = 15    # px, tolleranza per considerare "centrato"
+BASE_SPEED           = 0     # velocità base del veicolo
+STEERING_MULTIPLIER  = 10      # moltiplicatore per conversione angolo->servo
 
 # Setup directories
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -56,13 +52,10 @@ def cleanup():
     print("Cleanup completato")
 
 def apply_steering_to_picarx(steering_angle_deg):
-    """Applica l'angolo di sterzo al PicarX con mapping migliorato"""
-    # Limita l'angolo prima della conversione
-    steering_angle_deg = np.clip(steering_angle_deg, -MAX_STEERING_ANGLE, MAX_STEERING_ANGLE)
-    
-    # Converte l'angolo di sterzo in angolo servo con mapping piÃƒÂ¹ delicato
+    """Applica l'angolo di sterzo al PicarX"""
+    # Converte l'angolo di sterzo in angolo servo
     servo_angle = steering_angle_deg * STEERING_MULTIPLIER
-    servo_angle = np.clip(servo_angle, -30, 30)  # Limita ulteriormente per sicurezza
+    servo_angle = np.clip(servo_angle, -45, 45)
     
     # Applica al servo di direzione
     px.set_dir_servo_angle(servo_angle)
@@ -94,57 +87,6 @@ def average_line(lines, side, width, height):
     x2 = int(m * y2 + b)
     return (x1, y1, x2, y2)
 
-def calculate_steering_angle(left_line, right_line, left_valid, right_valid, bev_width, bev_height):
-    """Calcola l'angolo di sterzo basato sulle linee rilevate"""
-    center_x = bev_width // 2
-    base_y = bev_height - 1
-    
-    # Calcola le posizioni base delle linee
-    if left_valid:
-        lx1, ly1, lx2, ly2 = left_line
-        left_base_x = int(np.interp(base_y, [ly2, ly1], [lx2, lx1]))
-    
-    if right_valid:
-        rx1, ry1, rx2, ry2 = right_line
-        right_base_x = int(np.interp(base_y, [ry2, ry1], [rx2, ry1]))
-    
-    target_x = center_x  # Posizione target di default (centro)
-    
-    if left_valid and right_valid:
-        # Entrambe le linee visibili: calcola il centro della carreggiata
-        lane_center = (left_base_x + right_base_x) // 2
-        
-        # Verifica se siamo giÃƒÂ  abbastanza centrati
-        if abs(lane_center - center_x) <= LANE_CENTER_TOLERANCE:
-            return 0.0  # Mantieni direzione dritta
-        
-        # Altrimenti, punta verso il centro della carreggiata
-        target_x = lane_center
-        
-    elif left_valid:
-        # Solo linea sinistra: mantieni offset a destra
-        target_x = left_base_x + DESIRED_OFFSET
-        
-    elif right_valid:
-        # Solo linea destra: mantieni offset a sinistra
-        target_x = right_base_x - DESIRED_OFFSET
-    
-    else:
-        # Nessuna linea: mantieni direzione precedente
-        return previous_steering_angle
-    
-    # Calcola deviazione dal centro del BEV
-    deviation = target_x - center_x
-    
-    # Normalizza la deviazione (-1 a 1) e converti in angolo
-    max_deviation = bev_width // 2
-    normalized_deviation = np.clip(deviation / max_deviation, -1.0, 1.0)
-    
-    # Applica aggressivitÃƒÂ  e calcola angolo finale
-    steering_angle = -normalized_deviation * MAX_STEERING_ANGLE * STEERING_AGGRESSION
-    
-    return steering_angle
-
 def draw_steering_trajectory(img, steering_angle_deg):
     """Disegna la traiettoria prevista sul frame"""
     h, w = img.shape[:2]
@@ -155,18 +97,81 @@ def draw_steering_trajectory(img, steering_angle_deg):
     ey = int(cy - L * np.cos(rad))
     
     # Colore in base all'angolo
-    if abs(steering_angle_deg) < 10:
+    if abs(steering_angle_deg) < 15:
         color = (0, 255, 0)  # Verde: tutto ok
-    elif abs(steering_angle_deg) < 20:
+    elif abs(steering_angle_deg) < 30:
         color = (0, 165, 255)  # Arancione: attenzione
     else:
         color = (0, 0, 255)  # Rosso: curva stretta
     
     cv2.arrowedLine(img, (cx, cy), (ex, ey), color, 4)
-    cv2.putText(img, f"Steering: {steering_angle_deg:.1f}Ã‚Â°", (10, 50),
+    cv2.putText(img, f"Steering: {steering_angle_deg:.1f}°", (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
+def calculate_distances(lx_base, rx_base, center_x, lv, rv, bev_width):
+    """Calcola le distanze dal centro e tra le linee"""
+    # Distanza tra le linee (larghezza carreggiata)
+    if lv and rv:
+        lane_width = abs(rx_base - lx_base)
+    else:
+        lane_width = -1  # Non calcolabile
+    
+    # Distanza dal centro della carreggiata
+    if lv and rv:
+        # Se abbiamo entrambe le linee, il centro della carreggiata è la media
+        lane_center = (lx_base + rx_base) / 2
+        distance_from_center = center_x - lane_center
+    elif lv:
+        # Solo linea sinistra: assumiamo larghezza standard di 150px
+        estimated_lane_center = lx_base + 75
+        distance_from_center = center_x - estimated_lane_center
+    elif rv:
+        # Solo linea destra: assumiamo larghezza standard di 150px
+        estimated_lane_center = rx_base - 75
+        distance_from_center = center_x - estimated_lane_center
+    else:
+        distance_from_center = 0  # Non calcolabile
+    
+    return lane_width, distance_from_center
+
+def draw_distance_info(frame, lane_width, distance_from_center, h):
+    """Disegna le informazioni di distanza sul frame"""
+    # Colore per il testo basato sulla distanza dal centro
+    if abs(distance_from_center) < 20:
+        center_color = (0, 255, 0)  # Verde: ben centrato
+    elif abs(distance_from_center) < 40:
+        center_color = (0, 165, 255)  # Arancione: leggermente fuori centro
+    else:
+        center_color = (0, 0, 255)  # Rosso: molto fuori centro
+    
+    # Colore per larghezza carreggiata
+    if lane_width > 120:
+        width_color = (0, 255, 0)  # Verde: larghezza normale
+    elif lane_width > 80:
+        width_color = (0, 165, 255)  # Arancione: carreggiata stretta
+    elif lane_width > 0:
+        width_color = (0, 0, 255)  # Rosso: carreggiata molto stretta
+    else:
+        width_color = (128, 128, 128)  # Grigio: non calcolabile
+    
+    # Disegna le informazioni
+    if lane_width > 0:
+        cv2.putText(frame, f"Larghezza carreggiata: {lane_width:.1f}px", (10, h-160), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, width_color, 2)
+    else:
+        cv2.putText(frame, "Larghezza carreggiata: N/A", (10, h-160), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, width_color, 2)
+    
+    cv2.putText(frame, f"Distanza dal centro: {distance_from_center:.1f}px", (10, h-190), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, center_color, 2)
+    
+    # Aggiungi indicatore di direzione
+    direction = "Centro" if abs(distance_from_center) < 10 else ("Sinistra" if distance_from_center > 0 else "Destra")
+    cv2.putText(frame, f"Posizione: {direction}", (10, h-220), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, center_color, 2)
+
 def process_frame():
+    
     global BASE_SPEED
     
     """Processa un singolo frame dalla camera"""
@@ -227,14 +232,16 @@ def process_frame():
     base_y = bev.shape[0] - 1
     lx_base = int(np.interp(base_y, [ly2, ly1], [lx2, lx1])) if lv else 0
     rx_base = int(np.interp(base_y, [ry2, ry1], [rx2, rx1])) if rv else bev.shape[1] - 1
-    lane_width = abs(rx_base - lx_base)
+    
+    # Calcola distanze
+    center_x = bev.shape[1] // 2
+    lane_width, distance_from_center = calculate_distances(lx_base, rx_base, center_x, lv, rv, bev.shape[1])
 
     # Verifiche per ignorare il frame
     ignored_reasons = []
     if lv and rv and lane_width < MIN_LANE_WIDTH:
         ignored_reasons.append("Carreggiata troppo piccola")
     
-    center_x = bev.shape[1] // 2
     if (lv and abs(lx_base - center_x) < MIN_CENTER_DISTANCE) or \
        (rv and abs(rx_base - center_x) < MIN_CENTER_DISTANCE):
         ignored_reasons.append("Linea vicina al centro")
@@ -244,16 +251,37 @@ def process_frame():
         steering_angle = previous_steering_angle
         print(f"Frame ignorato: {', '.join(ignored_reasons)}")
     else:
-        steering_angle = calculate_steering_angle(
-            left_line, right_line, lv, rv, 
-            bev.shape[1], bev.shape[0]
-        )
+        if lv and rv:
+            # Entrambe le linee visibili: va dritto
+            steering_angle = 0.0
+        elif lv or rv:
+            # Solo una linea visibile: segui quella linea
+            OFFSET_PX = 20 # offset laterale desiderato
 
-    # Smoothing migliorato per evitare movimenti bruschi
-    max_change = 15  # Massimo cambiamento per frame
-    if abs(steering_angle - previous_steering_angle) > max_change:
-        change_direction = np.sign(steering_angle - previous_steering_angle)
-        steering_angle = previous_steering_angle + change_direction * max_change
+            if lv or rv:
+                if lv:
+                    # Calcolo offset rispetto alla linea sinistra
+                    base_x = int(np.interp(bev.shape[0] - 1, [ly2, ly1], [lx2, lx1]))
+                    offset_target = base_x + OFFSET_PX
+                else:
+                    # Calcolo offset rispetto alla linea destra
+                    base_x = int(np.interp(bev.shape[0] - 1, [ry2, ry1], [rx2, rx1]))
+                    offset_target = base_x - OFFSET_PX
+
+                # Calcolo deviazione da centro del BEV
+                center_x = bev.shape[1] // 2
+                dx = offset_target - center_x
+
+                # Normalizza e mappa in angolo di sterzo
+                steering_angle = -np.clip(dx / center_x, -1.0, 1.0) * MAX_STEERING_ANGLE
+
+        else:
+            # Nessuna linea: mantieni direzione precedente
+            steering_angle = previous_steering_angle
+
+    # Smoothing per evitare movimenti bruschi
+    if abs(steering_angle - previous_steering_angle) > 20:
+        steering_angle = previous_steering_angle + np.sign(steering_angle - previous_steering_angle) * 10
     
     previous_steering_angle = steering_angle
 
@@ -276,16 +304,11 @@ def process_frame():
     cv2.fillPoly(overlay_lane, [np.array([l1, l2, r2, r1], dtype=np.int32)], (0,255,0))
     frame = cv2.addWeighted(overlay_lane, 0.3, frame, 0.7, 0)
 
-    # Aggiunge informazioni testuali con debug aggiuntivo
-    cv2.putText(frame, f"Larghezza: {lane_width}px", (10, h-100), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    # Aggiunge informazioni testuali (incluse le nuove distanze)
+    draw_distance_info(frame, lane_width, distance_from_center, h)
+    
     cv2.putText(frame, f"Velocita: {BASE_SPEED}px/s", (10, h-130), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-    
-    # Mostra stato linee
-    status = f"L:{lv} R:{rv}"
-    cv2.putText(frame, status, (10, h-160), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
     
     if ignored_reasons:
         text = ", ".join(ignored_reasons)
@@ -319,7 +342,7 @@ def process_frame():
             BASE_SPEED = 1
             px.forward(BASE_SPEED)
     except:
-        # Se non c'ÃƒÂ¨ display, ignora gli errori di visualizzazione
+        # Se non c'è display, ignora gli errori di visualizzazione
         pass
     
     return True
