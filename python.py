@@ -78,7 +78,14 @@ def calculate_angle(coords):
     # rispetto all'asse verticale (positivo verso destra).
     angle = math.degrees(math.atan2(x2 - x1, y2 - y1))
 
-    return angle
+    # Normalizzazione dell'angolo tra -45 e 45 gradi
+    min_real, max_real = -50, 50
+    new_min, new_max = -45, 45
+
+    # Clamp per evitare extrapolazioni
+    normalized_angle = new_min + ((angle - min_real) * (new_max - new_min) / (max_real - min_real))
+
+    return normalized_angle
 
 while True:
 
