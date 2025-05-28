@@ -22,7 +22,7 @@ time.sleep(2)
 # Steering control parameters
 last_steering_angle = 0.0
 Kp = 0.5  # Proportional gain for steering (adjust as needed)
-base_speed = 0 # Base forward speed (adjust as needed) - Adjusted for potential movement
+base_speed = 0.1 # Base forward speed (adjust as needed) - SET THIS TO A POSITIVE VALUE TO MAKE THE ROBOT MOVE!
 
 def calculate_average_line_coords(image_shape, lines_segments):
     """
@@ -100,7 +100,7 @@ while True:
 
     # Perspective Transform (Bird's Eye View)
     src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bottom], [0, roi_bottom]])
-    dst_w, dst_h = 300, 200
+    dst_w, dst_h = 300, 200 # Standard size for bird's-eye view
     dst = np.float32([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]])
     matrix = cv2.getPerspectiveTransform(src, dst)
     bird_eye = cv2.warpPerspective(frame, matrix, (dst_w, dst_h))
@@ -158,6 +158,8 @@ while True:
     H_be, W_be = bird_eye.shape[:2]
     left_coords = calculate_average_line_coords(bird_eye.shape, left_segments)
     right_coords = calculate_average_line_coords(bird_eye.shape, right_segments)
+
+    # L_pt1, L_pt2, R_pt1, R_pt2 are for visualization later, derived from final coords
     L_pt1, L_pt2 = (left_coords[0], left_coords[1]), (left_coords[2], left_coords[3])
     R_pt1, R_pt2 = (right_coords[0], right_coords[1]), (right_coords[2], right_coords[3])
 
@@ -166,51 +168,77 @@ while True:
 
     # --- Steering Control Logic ---
     intended_steering_angle = 0.0
-    lane_width = W_be # Default to full image width if no lines are detected
-    both_lines_detected = left_coords != (0,0,0,0) and right_coords != (0,0,0,0)
+    lane_width = 0 # Will be calculated based on detected/inferred lines
 
-    if both_lines_detected:
-        L_bot_x = left_coords[2]
-        R_bot_x = right_coords[2]
-        lane_width = R_bot_x - L_bot_x
-        lane_center = (L_bot_x + R_bot_x) / 2
-        image_center = W_be / 2
-        deviation = image_center - lane_center
-        intended_steering_angle = -Kp * deviation # Steer proportionally to deviation
-    elif left_coords != (0,0,0,0) and left_angle is not None:
-        # If only the left line is seen, steer right (a fixed angle or based on left_angle)
-        intended_steering_angle = 30 # Fixed angle to steer right
-    elif right_coords != (0,0,0,0) and right_angle is not None:
-        # If only the right line is seen, steer left (a fixed angle or based on right_angle)
-        intended_steering_angle = -30 # Fixed angle to steer left
-    else:
-        # If no lines are detected, maintain the last steering angle (or go straight)
-        intended_steering_angle = last_steering_angle
+    # Define the bottom-left and bottom-right corners of the bird's-eye view
+    # for inferring missing lines
+    bottom_left_corner_x = 0
+    bottom_right_corner_x = W_be
+
+    # Get the bottom X-coordinates of the detected lines
+    # Store whether they were actually detected or are (0,0,0,0) (meaning not detected)
+    L_bot_x_detected_val = left_coords[2] if left_coords != (0,0,0,0) else None
+    R_bot_x_detected_val = right_coords[2] if right_coords != (0,0,0,0) else None
+
+    # Determine the actual X-coordinates for the lane calculation
+    # If a line is not detected, assume its bottom point is at the corresponding image corner
+    L_bot_x = L_bot_x_detected_val if L_bot_x_detected_val is not None else bottom_left_corner_x
+    R_bot_x = R_bot_x_detected_val if R_bot_x_detected_val is not None else bottom_right_corner_x
+
+    # Calculate lane_width and lane_center based on the determined L_bot_x and R_bot_x
+    lane_width = R_bot_x - L_bot_x
+    lane_center = (L_bot_x + R_bot_x) / 2
+    image_center = W_be / 2
+    deviation = image_center - lane_center
+
+    # Calculate intended steering angle based on deviation
+    intended_steering_angle = -Kp * deviation # Steer proportionally to deviation
+
+    # Check if both lines were truly detected
+    both_lines_truly_detected = (L_bot_x_detected_val is not None) and (R_bot_x_detected_val is not None)
 
     # Limit the steering angle to prevent extreme turns
     steering_angle = max(-45.0, min(45.0, intended_steering_angle))
 
-    # *** Lane Width Control ***
+    # *** Lane Width Control and No Line Detected Fallback ***
     # If both lines are detected AND the lane width is too small,
     # maintain the last steering angle to prevent overcorrection or false detection.
-    if both_lines_detected and lane_width < 180: # Adjust 180 as needed for your track
+    if both_lines_truly_detected and lane_width < 180: # Adjust 180 as needed for your track
         steering_angle = last_steering_angle
-        print(f"Larghezza {lane_width:.1f} < 180, mantengo angolo {last_steering_angle:.1f}")
+        print(f"Larghezza {lane_width:.1f} < 180 (entrambe le linee reali), mantengo angolo {last_steering_angle:.1f}")
+    elif not both_lines_truly_detected and L_bot_x_detected_val is None and R_bot_x_detected_val is None:
+        # If no lines were detected at all (both are inferred from corners)
+        steering_angle = last_steering_angle # Or set to 0 to go straight/stop
+        print("Nessuna linea rilevata, mantenendo l'ultimo angolo.")
     else:
-        print(f"Larghezza {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+        # Either both lines are detected and width is acceptable, or only one line is detected
+        # and the other is inferred from the corner. Proceed with calculated angle.
+        if L_bot_x_detected_val is None and R_bot_x_detected_val is not None:
+            print(f"Solo linea destra rilevata. Larghezza stimata: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+        elif R_bot_x_detected_val is None and L_bot_x_detected_val is not None:
+            print(f"Solo linea sinistra rilevata. Larghezza stimata: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+        else:
+            print(f"Entrambe le linee rilevate. Larghezza: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+
 
     # Apply the steering angle and speed to the PicarX
     px.set_dir_servo_angle(steering_angle)
-    px.forward(base_speed) # Set base_speed to a non-zero value to make the robot move
+    px.forward(base_speed)
 
     # Update the last steering angle for the next iteration
     last_steering_angle = steering_angle
     # --- End Steering Control ---
 
     # --- Visualization ---
-    # Prepare coordinates for drawing the lane polygon
+    # Prepare coordinates for drawing the lane polygon.
+    # Note: These poly_X_top/bot_x variables are for visualization *only*.
+    # The actual steering logic uses L_bot_x and R_bot_x which are inferred/clamped.
+
+    # If left_coords is (0,0,0,0), assume its bottom is at 0 and top is at 0 for drawing.
     poly_L_top_x = left_coords[0] if left_coords != (0,0,0,0) else 0
     poly_L_bot_x = left_coords[2] if left_coords != (0,0,0,0) else 0
+
+    # If right_coords is (0,0,0,0), assume its bottom is at W_be and top is at W_be for drawing.
     poly_R_top_x = right_coords[0] if right_coords != (0,0,0,0) else W_be
     poly_R_bot_x = right_coords[2] if right_coords != (0,0,0,0) else W_be
 
@@ -219,30 +247,21 @@ while True:
     pg_R_top = (poly_R_top_x, 0)
     pg_R_bot = (poly_R_bot_x, H_be)
 
-    # Define vertices for the lane polygon based on detected lines
-    if left_coords == (0,0,0,0) and right_coords != (0,0,0,0):
-        # Only right line detected, assume left boundary is image edge
-        pg_L_bot = (0, H_be)
-        verts = np.array([pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
-    elif right_coords == (0,0,0,0) and left_coords != (0,0,0,0):
-        # Only left line detected, assume right boundary is image edge
-        pg_R_bot = (W_be, H_be)
-        verts = np.array([pg_L_top, pg_L_bot, pg_R_bot], dtype=np.int32)
-    elif left_coords != (0,0,0,0) and right_coords != (0,0,0,0):
-        # Both lines detected, form a quadrilateral
-        verts = np.array([pg_L_top, pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
-    else:
-        # No lines detected, no polygon to draw
-        verts = np.array([], dtype=np.int32)
+    # Define vertices for the lane polygon based on detected lines.
+    # This logic now aligns with the assumption that missing lines are at image edges for visualization.
+    verts = np.array([pg_L_top, pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
+
 
     # Draw the lane polygon (green overlay)
     lanes_view = bird_eye.copy()
     if verts.size > 0:
         overlay = np.zeros_like(lanes_view)
+        # Ensure the polygon is a closed shape with 4 vertices.
+        # If L or R coords are (0,0,0,0), their corresponding poly_X values default to 0 or W_be.
         cv2.fillPoly(overlay, [verts], (0,255,0)) # Green color for the lane
         cv2.addWeighted(overlay, 0.3, lanes_view, 0.7, 0, lanes_view) # Blend overlay
 
-    # Draw the detected left and right lane lines
+    # Draw the detected left and right lane lines (only if they were actually detected)
     if left_coords != (0,0,0,0):
         cv2.line(lanes_view, L_pt1, L_pt2, (255,0,0), 3) # Blue for left line
     if right_coords != (0,0,0,0):
@@ -260,8 +279,10 @@ while True:
     right_text = f"Angolo Destro: {right_angle:.1f} deg" if right_angle is not None else "Angolo Destro: N/A"
     cv2.putText(lanes_view, right_text, (10, 40), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
-    width_text = f"Larghezza: {lane_width:.1f}" if both_lines_detected else "Larghezza: N/A"
+    # Display lane_width which is now always calculated
+    width_text = f"Larghezza: {lane_width:.1f}"
     cv2.putText(lanes_view, width_text, (10, 60), font, font_scale, font_color, thickness, cv2.LINE_AA)
+
     steer_text = f"Sterzata: {steering_angle:.1f} deg"
     cv2.putText(lanes_view, steer_text, (10, 80), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
