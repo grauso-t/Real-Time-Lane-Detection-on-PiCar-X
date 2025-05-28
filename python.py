@@ -21,6 +21,10 @@ time.sleep(1)  # tempo per inizializzare la camera
 
 px.forward(1)  # Imposta velocità di avanzamento
 
+# Variabili globali per il controllo dell'angolo
+previous_angle = 0.0
+smooth_factor = 0.3  # Fattore di smoothing (0.1 = molto smooth, 0.9 = poco smooth)
+
 def calculate_average_line_coords(image_shape, lines_segments):
     img_height = image_shape[0]
     default_coords = (0, 0, 0, 0)
@@ -46,6 +50,32 @@ def calculate_average_line_coords(image_shape, lines_segments):
         return (x_top_calc, y_top_draw, x_bottom_calc, y_bottom_draw)
     except (np.polynomial.polyutils.RankWarning, np.linalg.LinAlgError, TypeError):
         return default_coords
+
+def calculate_lane_width(left_coords, right_coords, image_width):
+    """
+    Calcola la larghezza della carreggiata e verifica se le linee sono troppo vicine al centro
+    """
+    # Se una delle due linee non è presente, non possiamo calcolare la larghezza
+    if left_coords == (0,0,0,0) or right_coords == (0,0,0,0):
+        return None, False, False
+    
+    # Calcola la posizione media delle linee sinistra e destra
+    left_center_x = (left_coords[0] + left_coords[2]) / 2
+    right_center_x = (right_coords[0] + right_coords[2]) / 2
+    
+    # Calcola la larghezza della carreggiata
+    lane_width = abs(right_center_x - left_center_x)
+    
+    # Controlla se la larghezza è troppo piccola (< 180px)
+    width_too_small = lane_width < 180
+    
+    # Controlla se le linee sono troppo vicine al centro dell'immagine
+    center_x = image_width / 2
+    left_too_close = abs(left_center_x - center_x) < 30
+    right_too_close = abs(right_center_x - center_x) < 30
+    lines_too_close_to_center = left_too_close or right_too_close
+    
+    return lane_width, width_too_small, lines_too_close_to_center
 
 def calculate_angle(right_segments, left_segments):
     def get_average_vector(segments):
@@ -108,6 +138,12 @@ def calculate_angle(right_segments, left_segments):
     amplified_angle = custom_mapping(normalized_angle)
     return amplified_angle
 
+def apply_smoothing(new_angle, previous_angle, smooth_factor):
+    """
+    Applica lo smoothing all'angolo per evitare sterzate brusche
+    """
+    return previous_angle * (1 - smooth_factor) + new_angle * smooth_factor
+
 try:
     # Main loop - removed video file handling, using only camera
     while True:
@@ -157,13 +193,37 @@ try:
                 else:
                     right_segments.append((x1, y1, x2, y2))
 
-        angle = calculate_angle(right_segments, left_segments)
-        print(f"Angle: {angle:.2f} degrees")
-
         # Average line coords
         H_be, W_be = bird_eye.shape[:2]
         left_coords = calculate_average_line_coords(bird_eye.shape, left_segments)
         right_coords = calculate_average_line_coords(bird_eye.shape, right_segments)
+        
+        # Calcola la larghezza della carreggiata e verifica le condizioni
+        lane_width, width_too_small, lines_too_close = calculate_lane_width(left_coords, right_coords, W_be)
+        
+        # Calcola il nuovo angolo
+        new_angle = calculate_angle(right_segments, left_segments)
+        
+        # Determina se usare il nuovo angolo o mantenere quello precedente
+        if lane_width is not None:
+            if width_too_small or lines_too_close:
+                # Mantieni l'angolo precedente se la carreggiata è troppo stretta o le linee troppo vicine al centro
+                final_angle = previous_angle
+                status = f"MANTAIN PREV ANGLE - Width: {lane_width:.1f}px, TooSmall: {width_too_small}, TooClose: {lines_too_close}"
+            else:
+                # Applica smoothing al nuovo angolo
+                final_angle = apply_smoothing(new_angle, previous_angle, smooth_factor)
+                status = f"NEW ANGLE (smoothed) - Width: {lane_width:.1f}px"
+        else:
+            # Se non possiamo calcolare la larghezza, usa il nuovo angolo con smoothing
+            final_angle = apply_smoothing(new_angle, previous_angle, smooth_factor)
+            status = "NEW ANGLE (no width calc)"
+        
+        # Aggiorna l'angolo precedente per il prossimo frame
+        previous_angle = final_angle
+        
+        print(f"Angle: {final_angle:.2f}° | Raw: {new_angle:.2f}° | {status}")
+
         L_pt1, L_pt2 = (left_coords[0], left_coords[1]), (left_coords[2], left_coords[3])
         R_pt1, R_pt2 = (right_coords[0], right_coords[1]), (right_coords[2], right_coords[3])
 
@@ -202,8 +262,13 @@ try:
         if right_coords != (0,0,0,0): 
             cv2.line(lanes_view, R_pt1, R_pt2, (0,0,255), 2)
 
+        # Aggiungi testo con informazioni di debug
+        if lane_width is not None:
+            cv2.putText(lanes_view, f"Width: {lane_width:.1f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        cv2.putText(lanes_view, f"Angle: {final_angle:.1f}°", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
         # Fixed: correct method call for setting servo angle
-        px.set_dir_servo_angle(angle)
+        px.set_dir_servo_angle(final_angle)
 
         # Display
         cv2.imshow("Detected Lanes", lanes_view)
