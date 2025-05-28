@@ -2,33 +2,34 @@ import cv2
 import time
 import numpy as np
 import math
-from picamera2 import Picamera2
+
 from picarx import Picarx
+from picamera2 import Picamera2
 
 px = Picarx()
-px.forward(0)
-px.set_dir_servo_angle(0)
+px.forward(0)  # Start with zero speed
 
-# Inizializza la camera
+# Initialize PiCamera2
 picam2 = Picamera2()
-picam2.preview_configuration.main.size = (640, 480)
-picam2.preview_configuration.main.format = "RGB888"
-picam2.configure("preview")
-
-# Avvia la camera
+config = picam2.create_preview_configuration(main={"size": (640, 480)})
+picam2.configure(config)
 picam2.start()
-time.sleep(1)
 
-px.forward(1)
-
-# Variabili globali per il controllo dell'angolo
-previous_angle = 0.0
-smooth_factor = 0.3
-# NUOVA SOGLIA: Larghezza minima della carreggiata per considerare affidabile il calcolo dell'angolo.
-# Regola questo valore in base ai tuoi test. Deve essere > 180 (valore di width_too_small).
-MIN_WIDTH_THRESHOLD = 220 # Esempio: 220 pixel
+# Wait for camera to initialize
+time.sleep(2)
 
 def calculate_average_line_coords(image_shape, lines_segments):
+    """
+    Calcola le coordinate medie di una linea a partire dai segmenti rilevati.
+
+    Args:
+        image_shape: Le dimensioni dell'immagine (altezza, larghezza).
+        lines_segments: Una lista di segmenti di linea [(x1, y1, x2, y2), ...].
+
+    Returns:
+        Una tupla (x1, y1, x2, y2) con le coordinate della linea media,
+        o (0, 0, 0, 0) se non è possibile calcolarla.
+    """
     img_height = image_shape[0]
     default_coords = (0, 0, 0, 0)
 
@@ -41,209 +42,175 @@ def calculate_average_line_coords(image_shape, lines_segments):
         x_coords.extend([x1_seg, x2_seg])
         y_coords.extend([y1_seg, y2_seg])
 
+    # Controlla se ci sono abbastanza punti unici per polyfit
     if not x_coords or not y_coords or len(np.unique(y_coords)) < 2:
         return default_coords
 
     try:
+        # Esegue un fit polinomiale di primo grado (retta) scambiando x e y
+        # per gestire meglio le linee quasi verticali.
         poly_coeffs = np.polyfit(y_coords, x_coords, deg=1)
-        y_top_draw = 0
-        y_bottom_draw = img_height
+        y_top_draw = 0  # Y superiore dell'immagine
+        y_bottom_draw = img_height # Y inferiore dell'immagine
+        # Calcola le coordinate X corrispondenti
         x_top_calc = int(poly_coeffs[0] * y_top_draw + poly_coeffs[1])
         x_bottom_calc = int(poly_coeffs[0] * y_bottom_draw + poly_coeffs[1])
         return (x_top_calc, y_top_draw, x_bottom_calc, y_bottom_draw)
     except (np.polynomial.polyutils.RankWarning, np.linalg.LinAlgError, TypeError):
+        # Gestisce errori durante il polyfit
         return default_coords
 
-def calculate_lane_width(left_coords, right_coords, image_width):
-    if left_coords == (0,0,0,0) or right_coords == (0,0,0,0):
-        return None, False, False
+def calculate_angle(coords):
+    """
+    Calcola l'angolo di una linea rispetto all'asse verticale.
 
-    left_center_x = (left_coords[0] + left_coords[2]) / 2
-    right_center_x = (right_coords[0] + right_coords[2]) / 2
-    lane_width = abs(right_center_x - left_center_x)
-    width_too_small = lane_width < 180
+    Args:
+        coords: Una tupla (x1, y1, x2, y2) con le coordinate della linea.
 
-    center_x = image_width / 2
-    left_too_close = abs(left_center_x - center_x) < 30
-    right_too_close = abs(right_center_x - center_x) < 30
-    lines_too_close_to_center = left_too_close or right_too_close
+    Returns:
+        L'angolo in gradi, o None se le coordinate sono (0, 0, 0, 0).
+    """
+    if coords == (0, 0, 0, 0):
+        return None
+    x1, y1, x2, y2 = coords
+    # Calcola l'angolo usando atan2 e converte in gradi.
+    # Usiamo (x2 - x1) e (y2 - y1) per ottenere l'angolo
+    # rispetto all'asse verticale (positivo verso destra).
+    angle = math.degrees(math.atan2(x2 - x1, y2 - y1))
 
-    return lane_width, width_too_small, lines_too_close_to_center
+    return angle
 
-def calculate_angle(right_segments, left_segments):
-    def get_average_vector(segments):
-        if not segments:
-            return None
-        dx_total, dy_total = 0, 0
-        for x1, y1, x2, y2 in segments:
-            dx_total += (x2 - x1)
-            dy_total += (y2 - y1)
-        return (dx_total, dy_total)
+while True:
 
-    left_vec = get_average_vector(left_segments)
-    right_vec = get_average_vector(right_segments)
+    frame = picam2.capture_array()
 
-    if left_vec and right_vec:
-        angle = 0.0 # Se vede entrambe le linee, idealmente dovrebbe andare dritto (0) o mediare? Per ora 0.
+    h, w = frame.shape[:2]
+    # Definisce la regione di interesse (ROI) nella parte inferiore dell'immagine
+    roi_top, roi_bottom = int(h * 0.6), h
+
+    # Trasformazione prospettica per ottenere la vista a volo d'uccello (bird-eye)
+    src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bottom], [0, roi_bottom]])
+    dst_w, dst_h = 300, 200 # Dimensioni dell'immagine bird-eye
+    dst = np.float32([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]])
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    bird_eye = cv2.warpPerspective(frame, matrix, (dst_w, dst_h))
+
+    # Pre-processing sull'immagine bird-eye
+    gaussian = cv2.GaussianBlur(bird_eye, (5, 5), 0) # Sfocatura Gaussiana
+    hls = cv2.cvtColor(gaussian, cv2.COLOR_BGR2HLS) # Conversione a HLS
+    # Maschera per il colore giallo
+    yellow_mask = cv2.inRange(hls, np.array([15, 40, 100]), np.array([35, 255, 255]))
+    # Maschera per il colore bianco
+    white_mask = cv2.inRange(hls, np.array([0, 200, 0]), np.array([180, 255, 255]))
+    mask = cv2.bitwise_or(yellow_mask, white_mask) # Combina le maschere
+    # Operazioni morfologiche per pulire la maschera
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+    # Rilevamento dei bordi e trasformata di Hough
+    edges = cv2.Canny(mask, 50, 150)
+    detected_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 30, minLineLength=15, maxLineGap=20)
+
+    # Separa i segmenti per pendenza e lato (sinistro/destro)
+    left_segments, right_segments = [], []
+    if detected_lines is not None:
+        for seg in detected_lines:
+            x1, y1, x2, y2 = seg[0]
+            if x2 - x1 == 0: # Linea verticale
+                if x1 < bird_eye.shape[1] / 2:
+                    left_segments.append((x1, y1, x2, y2))
+                else:
+                    right_segments.append((x1, y1, x2, y2))
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            # Ignora linee troppo orizzontali
+            if abs(slope) < 0.4:
+                continue
+
+            if slope < 0:
+                left_segments.append((x1, y1, x2, y2))
+            else:
+                right_segments.append((x1, y1, x2, y2))
+
+    # Calcola le coordinate medie delle linee
+    H_be, W_be = bird_eye.shape[:2]
+    left_coords = calculate_average_line_coords(bird_eye.shape, left_segments)
+    right_coords = calculate_average_line_coords(bird_eye.shape, right_segments)
+    L_pt1, L_pt2 = (left_coords[0], left_coords[1]), (left_coords[2], left_coords[3])
+    R_pt1, R_pt2 = (right_coords[0], right_coords[1]), (right_coords[2], right_coords[3])
+
+    # Calcola gli angoli
+    left_angle = calculate_angle(left_coords)
+    right_angle = calculate_angle(right_coords)
+
+    # Coordinate per il poligono che rappresenta la corsia
+    poly_L_top_x = left_coords[0] if left_coords != (0,0,0,0) else 0
+    poly_L_bot_x = left_coords[2] if left_coords != (0,0,0,0) else 0
+    poly_R_top_x = right_coords[0] if right_coords != (0,0,0,0) else W_be
+    poly_R_bot_x = right_coords[2] if right_coords != (0,0,0,0) else W_be
+
+    pg_L_top = (poly_L_top_x, 0)
+    pg_L_bot = (poly_L_bot_x, H_be)
+    pg_R_top = (poly_R_top_x, 0)
+    pg_R_bot = (poly_R_bot_x, H_be)
+
+    # Costruisce i vertici del poligono (triangolo o quadrilatero)
+    if left_coords == (0,0,0,0) and right_coords != (0,0,0,0):
+        pg_L_bot = (0, H_be)
+        verts = np.array([pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
+    elif right_coords == (0,0,0,0) and left_coords != (0,0,0,0):
+        pg_R_bot = (W_be, H_be)
+        verts = np.array([pg_L_top, pg_L_bot, pg_R_bot], dtype=np.int32)
+    elif left_coords != (0,0,0,0) and right_coords != (0,0,0,0):
+        verts = np.array([pg_L_top, pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
     else:
-        vec = left_vec if left_vec else right_vec
-        if not vec:
-            angle = 0.0
-        else:
-            dx, dy = vec
-            if dx == 0:
-                angle = 0
-            else:
-                angle_rad = math.atan2(dy, dx)
-                angle = math.degrees(angle_rad)
+        verts = np.array([], dtype=np.int32)
 
-    min_real, max_real = -80, 80
-    new_min, new_max = -45, 45
-    angle = max(min(angle, max_real), min_real)
-    normalized_angle = new_min + ((angle - min_real) * (new_max - new_min) / (max_real - min_real))
+    # Crea la vista delle corsie e disegna il poligono
+    lanes_view = bird_eye.copy()
+    if verts.size > 0:
+        overlay = np.zeros_like(lanes_view)
+        cv2.fillPoly(overlay, [verts], (0,255,0)) # Poligono verde
+        cv2.addWeighted(overlay, 0.3, lanes_view, 0.7, 0, lanes_view) # Sovrappone con trasparenza
 
-    def custom_mapping(value):
-        mapping_points = [
-            (-45, -45), (-25, -35), (0, 0), (25, 35), (45, 45)
-        ]
-        for i in range(len(mapping_points) - 1):
-            x1, y1 = mapping_points[i]
-            x2, y2 = mapping_points[i + 1]
-            if x1 <= value <= x2:
-                t = (value - x1) / (x2 - x1) if x2 != x1 else 0
-                return y1 + t * (y2 - y1)
-        return value
+    # Disegna le linee medie
+    if left_coords != (0,0,0,0):
+        cv2.line(lanes_view, L_pt1, L_pt2, (255,0,0), 3) # Linea sinistra blu
+    if right_coords != (0,0,0,0):
+        cv2.line(lanes_view, R_pt1, R_pt2, (0,0,255), 3) # Linea destra rossa
 
-    amplified_angle = custom_mapping(normalized_angle)
-    return amplified_angle
+    # --- Visualizza gli angoli ---
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_color = (255, 255, 255) # Bianco
+    thickness = 1
 
-def apply_smoothing(new_angle, previous_angle, smooth_factor):
-    return previous_angle * (1 - smooth_factor) + new_angle * smooth_factor
+    # Angolo sinistro
+    left_text = f"Angolo Sinistro: {left_angle:.1f} deg" if left_angle is not None else "Angolo Sinistro: N/A"
+    cv2.putText(lanes_view, left_text, (10, 20), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
-try:
-    while True:
-        frame = picam2.capture_array()
-        if frame is None:
-            break
+    # Angolo destro
+    right_text = f"Angolo Destro: {right_angle:.1f} deg" if right_angle is not None else "Angolo Destro: N/A"
+    cv2.putText(lanes_view, right_text, (10, 40), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    # --- Fine visualizzazione angoli ---
 
-        h, w = frame.shape[:2]
-        roi_top, roi_bottom = int(h * 0.6), h
 
-        src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bottom], [0, roi_bottom]])
-        dst_w, dst_h = 300, 200
-        dst = np.float32([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]])
-        matrix = cv2.getPerspectiveTransform(src, dst)
-        bird_eye = cv2.warpPerspective(frame, matrix, (dst_w, dst_h))
+    # Mostra i risultati
+    cv2.imshow("Corsie Rilevate", lanes_view)
+    cv2.imshow("Maschera", mask)
+    # Disegna il rettangolo della ROI sul frame originale
+    cv2.rectangle(frame, (0, roi_top), (w, roi_bottom), (0,255,0), 2)
+    cv2.imshow("Video Originale con ROI", frame)
 
-        gaussian = cv2.GaussianBlur(bird_eye, (5, 5), 0)
-        hls = cv2.cvtColor(gaussian, cv2.COLOR_BGR2HLS)
-        yellow_mask = cv2.inRange(hls, np.array([15, 40, 100]), np.array([35, 255, 255]))
-        white_mask = cv2.inRange(hls, np.array([0, 200, 0]), np.array([180, 255, 255]))
-        mask = cv2.bitwise_or(yellow_mask, white_mask)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # Interrompe il loop se viene premuto 'q'
+    if cv2.waitKey(25) & 0xFF == ord('q'):
+        break
+    # Aggiunge un piccolo ritardo (opzionale, per rallentare la visualizzazione)
+    # time.sleep(0.04)
 
-        edges = cv2.Canny(mask, 50, 150)
-        detected_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 30, minLineLength=15, maxLineGap=20)
-
-        left_segments, right_segments = [], []
-        if detected_lines is not None:
-            for seg in detected_lines:
-                x1, y1, x2, y2 = seg[0]
-                if x2 - x1 == 0:
-                    if x1 < bird_eye.shape[1] / 2: left_segments.append((x1, y1, x2, y2))
-                    else: right_segments.append((x1, y1, x2, y2))
-                    continue
-                slope = (y2 - y1) / (x2 - x1)
-                if abs(slope) < 0.4: continue
-                if slope < 0: left_segments.append((x1, y1, x2, y2))
-                else: right_segments.append((x1, y1, x2, y2))
-
-        H_be, W_be = bird_eye.shape[:2]
-        left_coords = calculate_average_line_coords(bird_eye.shape, left_segments)
-        right_coords = calculate_average_line_coords(bird_eye.shape, right_segments)
-
-        lane_width, width_too_small, lines_too_close = calculate_lane_width(left_coords, right_coords, W_be)
-        new_angle = calculate_angle(right_segments, left_segments)
-
-        # --- MODIFICA LOGICA ANGOLO ---
-        if lane_width is not None:
-            # Verifica se la larghezza è troppo piccola, le linee troppo vicine
-            # O se la larghezza è SOTTO la nostra nuova soglia minima.
-            is_below_min_threshold = lane_width < MIN_WIDTH_THRESHOLD
-            if width_too_small or lines_too_close or is_below_min_threshold:
-                # Se una di queste condizioni è vera, mantieni l'angolo precedente.
-                final_angle = previous_angle
-                status = f"MANTAIN PREV - W: {lane_width:.1f} (Small:{width_too_small}, Close:{lines_too_close}, BelowMin:{is_below_min_threshold})"
-            else:
-                # Altrimenti, se la larghezza è OK, usa il nuovo angolo (con smoothing).
-                final_angle = apply_smoothing(new_angle, previous_angle, smooth_factor)
-                status = f"NEW ANGLE (smoothed) - W: {lane_width:.1f}"
-        else:
-            # Se non possiamo calcolare la larghezza, mantieni l'angolo precedente per sicurezza.
-            final_angle = previous_angle
-            status = "MANTAIN PREV (no width calc)"
-        # --- FINE MODIFICA ---
-
-        previous_angle = final_angle
-        print(f"Angle: {final_angle:.2f}° | Raw: {new_angle:.2f}° | {status}")
-
-        L_pt1, L_pt2 = (left_coords[0], left_coords[1]), (left_coords[2], left_coords[3])
-        R_pt1, R_pt2 = (right_coords[0], right_coords[1]), (right_coords[2], right_coords[3])
-
-        poly_L_top_x = left_coords[0] if left_coords != (0,0,0,0) else 0
-        poly_L_bot_x = left_coords[2] if left_coords != (0,0,0,0) else 0
-        poly_R_top_x = right_coords[0] if right_coords != (0,0,0,0) else W_be
-        poly_R_bot_x = right_coords[2] if right_coords != (0,0,0,0) else W_be
-
-        pg_L_top = (poly_L_top_x, 0)
-        pg_L_bot = (poly_L_bot_x, H_be)
-        pg_R_top = (poly_R_top_x, 0)
-        pg_R_bot = (poly_R_bot_x, H_be)
-
-        if left_coords == (0,0,0,0) and right_coords != (0,0,0,0):
-            pg_L_bot = (0, H_be)
-            verts = np.array([pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
-        elif right_coords == (0,0,0,0) and left_coords != (0,0,0,0):
-            pg_R_bot = (W_be, H_be)
-            verts = np.array([pg_L_top, pg_L_bot, pg_R_bot], dtype=np.int32)
-        elif left_coords != (0,0,0,0) and right_coords != (0,0,0,0):
-            verts = np.array([pg_L_top, pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
-        else:
-            verts = np.array([], dtype=np.int32)
-
-        lanes_view = bird_eye.copy()
-        if verts.size > 0:
-            overlay = np.zeros_like(lanes_view)
-            cv2.fillPoly(overlay, [verts], (0,255,0))
-            cv2.addWeighted(overlay, 0.5, lanes_view, 0.5, 0, lanes_view)
-
-        if left_coords != (0,0,0,0): cv2.line(lanes_view, L_pt1, L_pt2, (255,0,0), 2)
-        if right_coords != (0,0,0,0): cv2.line(lanes_view, R_pt1, R_pt2, (0,0,255), 2)
-
-        if lane_width is not None:
-            cv2.putText(lanes_view, f"Width: {lane_width:.1f}px", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        cv2.putText(lanes_view, f"Angle: {final_angle:.1f}°", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-
-        px.set_dir_servo_angle(final_angle)
-
-        cv2.imshow("Detected Lanes", lanes_view)
-        cv2.imshow("Mask", mask)
-        cv2.rectangle(frame, (0, roi_top), (w, roi_bottom), (0,255,0), 2)
-        cv2.imshow("Video", frame)
-
-        if cv2.waitKey(25) & 0xFF == ord('q'):
-            break
-        time.sleep(0.04)
-
-except KeyboardInterrupt:
-    print("Program interrupted by user")
-except Exception as e:
-    print(f"An error occurred: {e}")
-finally:
-    print("Cleaning up...")
-    px.forward(0)
-    px.set_dir_servo_angle(0)
-    cv2.destroyAllWindows()
-    picam2.stop()
-    print("Cleanup complete")
+# Rilascia il video e chiude tutte le finestre
+picam2.stop()
+picam2.close()
+px.stop()
+px.set_dir_servo_angle(0)
+cv2.destroyAllWindows()
