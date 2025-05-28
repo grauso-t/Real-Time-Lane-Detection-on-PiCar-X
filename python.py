@@ -18,6 +18,11 @@ picam2.start()
 # Wait for camera to initialize
 time.sleep(2)
 
+# Steering control parameters
+last_steering_angle = 0.0
+Kp = 0.5  # Proportional gain for steering (adjust as needed)
+base_speed = 0 # Base forward speed (adjust as needed)
+
 def calculate_average_line_coords(image_shape, lines_segments):
     """
     Calcola le coordinate medie di una linea a partire dai segmenti rilevati.
@@ -83,74 +88,103 @@ def calculate_angle(coords):
     new_min, new_max = -45, 45
 
     # Clamp per evitare extrapolazioni
-    normalized_angle = new_min + ((angle - min_real) * (new_max - new_min) / (max_real - min_real))
+    normalized_angle = max(new_min, min(new_max, new_min + ((angle - min_real) * (new_max - new_min) / (max_real - min_real))))
 
     return normalized_angle
 
 while True:
-
     frame = picam2.capture_array()
-
     h, w = frame.shape[:2]
-    # Definisce la regione di interesse (ROI) nella parte inferiore dell'immagine
     roi_top, roi_bottom = int(h * 0.6), h
 
-    # Trasformazione prospettica per ottenere la vista a volo d'uccello (bird-eye)
     src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bottom], [0, roi_bottom]])
-    dst_w, dst_h = 300, 200 # Dimensioni dell'immagine bird-eye
+    dst_w, dst_h = 300, 200
     dst = np.float32([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]])
     matrix = cv2.getPerspectiveTransform(src, dst)
     bird_eye = cv2.warpPerspective(frame, matrix, (dst_w, dst_h))
 
-    # Pre-processing sull'immagine bird-eye
-    gaussian = cv2.GaussianBlur(bird_eye, (5, 5), 0) # Sfocatura Gaussiana
-    hls = cv2.cvtColor(gaussian, cv2.COLOR_BGR2HLS) # Conversione a HLS
-    # Maschera per il colore giallo
+    gaussian = cv2.GaussianBlur(bird_eye, (5, 5), 0)
+    hls = cv2.cvtColor(gaussian, cv2.COLOR_BGR2HLS)
     yellow_mask = cv2.inRange(hls, np.array([15, 40, 100]), np.array([35, 255, 255]))
-    # Maschera per il colore bianco
     white_mask = cv2.inRange(hls, np.array([0, 200, 0]), np.array([180, 255, 255]))
-    mask = cv2.bitwise_or(yellow_mask, white_mask) # Combina le maschere
-    # Operazioni morfologiche per pulire la maschera
+    mask = cv2.bitwise_or(yellow_mask, white_mask)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
-    # Rilevamento dei bordi e trasformata di Hough
     edges = cv2.Canny(mask, 50, 150)
     detected_lines = cv2.HoughLinesP(edges, 1, np.pi/180, 30, minLineLength=15, maxLineGap=20)
 
-    # Separa i segmenti per pendenza e lato (sinistro/destro)
     left_segments, right_segments = [], []
     if detected_lines is not None:
         for seg in detected_lines:
             x1, y1, x2, y2 = seg[0]
-            if x2 - x1 == 0: # Linea verticale
+            if x2 - x1 == 0:
                 if x1 < bird_eye.shape[1] / 2:
                     left_segments.append((x1, y1, x2, y2))
                 else:
                     right_segments.append((x1, y1, x2, y2))
                 continue
             slope = (y2 - y1) / (x2 - x1)
-            # Ignora linee troppo orizzontali
             if abs(slope) < 0.4:
                 continue
-
             if slope < 0:
                 left_segments.append((x1, y1, x2, y2))
             else:
                 right_segments.append((x1, y1, x2, y2))
 
-    # Calcola le coordinate medie delle linee
     H_be, W_be = bird_eye.shape[:2]
     left_coords = calculate_average_line_coords(bird_eye.shape, left_segments)
     right_coords = calculate_average_line_coords(bird_eye.shape, right_segments)
     L_pt1, L_pt2 = (left_coords[0], left_coords[1]), (left_coords[2], left_coords[3])
     R_pt1, R_pt2 = (right_coords[0], right_coords[1]), (right_coords[2], right_coords[3])
 
-    # Calcola gli angoli
     left_angle = calculate_angle(left_coords)
     right_angle = calculate_angle(right_coords)
 
-    # Coordinate per il poligono che rappresenta la corsia
+    # --- Inizio Controlli Sterzata ---
+    intended_steering_angle = 0.0
+    lane_width = W_be # Default a larghezza massima se non ci sono linee
+    both_lines_detected = left_coords != (0,0,0,0) and right_coords != (0,0,0,0)
+
+    if both_lines_detected:
+        L_bot_x = left_coords[2]
+        R_bot_x = right_coords[2]
+        lane_width = R_bot_x - L_bot_x
+        lane_center = (L_bot_x + R_bot_x) / 2
+        image_center = W_be / 2
+        deviation = image_center - lane_center
+        intended_steering_angle = -Kp * deviation # Sterza proporzionalmente alla deviazione
+    elif left_coords != (0,0,0,0) and left_angle is not None:
+        # Se vede solo la sinistra, sterza a destra (o usa l'angolo sx)
+        intended_steering_angle = 30 # Angolo fisso per sterzare a destra
+    elif right_coords != (0,0,0,0) and right_angle is not None:
+        # Se vede solo la destra, sterza a sinistra (o usa l'angolo dx)
+        intended_steering_angle = -30 # Angolo fisso per sterzare a sinistra
+    else:
+        # Se non vede linee, usa l'ultimo angolo
+        intended_steering_angle = last_steering_angle
+
+    # Limita l'angolo di sterzata
+    steering_angle = max(-45.0, min(45.0, intended_steering_angle))
+
+    # *** Controllo larghezza carreggiata ***
+    # Se entrambe le linee sono viste E la larghezza è troppo piccola,
+    # mantieni l'ultimo angolo di sterzata.
+    if both_lines_detected and lane_width < 180:
+        steering_angle = last_steering_angle
+        print(f"Larghezza {lane_width:.1f} < 180, mantengo angolo {last_steering_angle:.1f}")
+    else:
+        print(f"Larghezza {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+
+    # Applica l'angolo di sterzata e la velocità
+    px.set_dir_servo_angle(steering_angle)
+    px.forward(base_speed)
+
+    # Aggiorna l'ultimo angolo di sterzata
+    last_steering_angle = steering_angle
+    # --- Fine Controlli Sterzata ---
+
+
     poly_L_top_x = left_coords[0] if left_coords != (0,0,0,0) else 0
     poly_L_bot_x = left_coords[2] if left_coords != (0,0,0,0) else 0
     poly_R_top_x = right_coords[0] if right_coords != (0,0,0,0) else W_be
@@ -161,7 +195,6 @@ while True:
     pg_R_top = (poly_R_top_x, 0)
     pg_R_bot = (poly_R_bot_x, H_be)
 
-    # Costruisce i vertici del poligono (triangolo o quadrilatero)
     if left_coords == (0,0,0,0) and right_coords != (0,0,0,0):
         pg_L_bot = (0, H_be)
         verts = np.array([pg_R_top, pg_R_bot, pg_L_bot], dtype=np.int32)
@@ -173,51 +206,46 @@ while True:
     else:
         verts = np.array([], dtype=np.int32)
 
-    # Crea la vista delle corsie e disegna il poligono
     lanes_view = bird_eye.copy()
     if verts.size > 0:
         overlay = np.zeros_like(lanes_view)
-        cv2.fillPoly(overlay, [verts], (0,255,0)) # Poligono verde
-        cv2.addWeighted(overlay, 0.3, lanes_view, 0.7, 0, lanes_view) # Sovrappone con trasparenza
+        cv2.fillPoly(overlay, [verts], (0,255,0))
+        cv2.addWeighted(overlay, 0.3, lanes_view, 0.7, 0, lanes_view)
 
-    # Disegna le linee medie
     if left_coords != (0,0,0,0):
-        cv2.line(lanes_view, L_pt1, L_pt2, (255,0,0), 3) # Linea sinistra blu
+        cv2.line(lanes_view, L_pt1, L_pt2, (255,0,0), 3)
     if right_coords != (0,0,0,0):
-        cv2.line(lanes_view, R_pt1, R_pt2, (0,0,255), 3) # Linea destra rossa
+        cv2.line(lanes_view, R_pt1, R_pt2, (0,0,255), 3)
 
-    # --- Visualizza gli angoli ---
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
-    font_color = (255, 255, 255) # Bianco
+    font_color = (255, 255, 255)
     thickness = 1
 
-    # Angolo sinistro
     left_text = f"Angolo Sinistro: {left_angle:.1f} deg" if left_angle is not None else "Angolo Sinistro: N/A"
     cv2.putText(lanes_view, left_text, (10, 20), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
-    # Angolo destro
     right_text = f"Angolo Destro: {right_angle:.1f} deg" if right_angle is not None else "Angolo Destro: N/A"
     cv2.putText(lanes_view, right_text, (10, 40), font, font_scale, font_color, thickness, cv2.LINE_AA)
-    # --- Fine visualizzazione angoli ---
 
+    # Visualizza la larghezza e l'angolo di sterzata
+    width_text = f"Larghezza: {lane_width:.1f}" if both_lines_detected else "Larghezza: N/A"
+    cv2.putText(lanes_view, width_text, (10, 60), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    steer_text = f"Sterzata: {steering_angle:.1f} deg"
+    cv2.putText(lanes_view, steer_text, (10, 80), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
-    # Mostra i risultati
     cv2.imshow("Corsie Rilevate", lanes_view)
     cv2.imshow("Maschera", mask)
-    # Disegna il rettangolo della ROI sul frame originale
     cv2.rectangle(frame, (0, roi_top), (w, roi_bottom), (0,255,0), 2)
     cv2.imshow("Video Originale con ROI", frame)
 
-    # Interrompe il loop se viene premuto 'q'
     if cv2.waitKey(25) & 0xFF == ord('q'):
         break
-    # Aggiunge un piccolo ritardo (opzionale, per rallentare la visualizzazione)
-    # time.sleep(0.04)
 
 # Rilascia il video e chiude tutte le finestre
 picam2.stop()
 picam2.close()
-px.stop()
-px.set_dir_servo_angle(0)
+px.forward(0) # Ferma il robot
+px.set_dir_servo_angle(0) # Raddrizza le ruote
+time.sleep(0.5)
 cv2.destroyAllWindows()
