@@ -21,17 +21,17 @@ time.sleep(2)
 
 # Steering control parameters
 last_steering_angle = 0.0
-last_lane_width = 250.0  # Larghezza iniziale stimata
+last_lane_width = 300.0  # Larghezza iniziale stimata
 smoothing_factor = 0.3   # Fattore di smoothing per correzioni graduali
 
 # Parametri di controllo adattivo
 Kp_normal = 2.0          # Gain normale per carreggiata standard
 Kp_narrow = 5.0          # Gain aggressivo per carreggiata stretta
-narrow_threshold = 150   # Soglia per carreggiata stretta
+narrow_threshold = 250   # Soglia per carreggiata stretta
 wide_threshold = 300     # Soglia per carreggiata larga
 
 # Offset dal centro (50 pixel a destra del centro)
-center_offset = 50       # Positivo = sposta a destra, Negativo = sposta a sinistra
+center_offset = 10       # Positivo = sposta a destra, Negativo = sposta a sinistra
 
 base_speed = 1  # Set a positive value to make the robot move
 
