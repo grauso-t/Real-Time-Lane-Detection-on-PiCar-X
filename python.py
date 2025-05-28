@@ -22,7 +22,12 @@ time.sleep(2)
 # Steering control parameters
 last_steering_angle = 0.0
 Kp = 0.5  # Proportional gain for steering (adjust as needed)
-base_speed = 0.1 # Base forward speed (adjust as needed) - SET THIS TO A POSITIVE VALUE TO MAKE THE ROBOT MOVE!
+base_speed = 0 # Base forward speed (adjust as needed) - SET THIS TO A POSITIVE VALUE TO MAKE THE ROBOT MOVE!
+
+# Define a threshold for how close a single line can be to the center
+# before we ignore its steering suggestion.
+# This value will need tuning based on your bird's-eye view.
+SINGLE_LINE_CENTER_THRESHOLD = 50 # pixels from image center
 
 def calculate_average_line_coords(image_shape, lines_segments):
     """
@@ -197,28 +202,37 @@ while True:
     # Check if both lines were truly detected
     both_lines_truly_detected = (L_bot_x_detected_val is not None) and (R_bot_x_detected_val is not None)
 
-    # Limit the steering angle to prevent extreme turns
+    # Limit the steering angle to prevent extreme turns (pre-emptively, will be overridden by logic below)
     steering_angle = max(-45.0, min(45.0, intended_steering_angle))
 
-    # *** Lane Width Control and No Line Detected Fallback ***
-    # If both lines are detected AND the lane width is too small,
-    # maintain the last steering angle to prevent overcorrection or false detection.
-    if both_lines_truly_detected and lane_width < 180: # Adjust 180 as needed for your track
-        steering_angle = last_steering_angle
-        print(f"Larghezza {lane_width:.1f} < 180 (entrambe le linee reali), mantengo angolo {last_steering_angle:.1f}")
-    elif not both_lines_truly_detected and L_bot_x_detected_val is None and R_bot_x_detected_val is None:
+    # --- Lane Width Control and No Line Detected / Single Line Too Close to Center Fallback ---
+    if both_lines_truly_detected:
+        if lane_width < 180: # Adjust 180 as needed for your track
+            steering_angle = last_steering_angle
+            print(f"Larghezza {lane_width:.1f} < 180 (entrambe le linee reali), mantengo angolo {last_steering_angle:.1f}")
+        else:
+            # Both lines detected and width is acceptable, use calculated angle
+            print(f"Entrambe le linee rilevate. Larghezza: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+    elif L_bot_x_detected_val is None and R_bot_x_detected_val is None:
         # If no lines were detected at all (both are inferred from corners)
         steering_angle = last_steering_angle # Or set to 0 to go straight/stop
         print("Nessuna linea rilevata, mantenendo l'ultimo angolo.")
-    else:
-        # Either both lines are detected and width is acceptable, or only one line is detected
-        # and the other is inferred from the corner. Proceed with calculated angle.
-        if L_bot_x_detected_val is None and R_bot_x_detected_val is not None:
-            print(f"Solo linea destra rilevata. Larghezza stimata: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
-        elif R_bot_x_detected_val is None and L_bot_x_detected_val is not None:
-            print(f"Solo linea sinistra rilevata. Larghezza stimata: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+    elif L_bot_x_detected_val is not None: # Only left line is detected
+        # Check if the detected left line is too close to the center
+        if abs(L_bot_x_detected_val - image_center) < SINGLE_LINE_CENTER_THRESHOLD:
+            steering_angle = last_steering_angle
+            print(f"Solo linea sinistra rilevata ({L_bot_x_detected_val:.1f}), ma troppo vicina al centro. Mantengo angolo {last_steering_angle:.1f}")
         else:
-            print(f"Entrambe le linee rilevate. Larghezza: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+            # Left line is detected and not too close to center, use calculated angle
+            print(f"Solo linea sinistra rilevata. Larghezza stimata: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
+    elif R_bot_x_detected_val is not None: # Only right line is detected
+        # Check if the detected right line is too close to the center
+        if abs(R_bot_x_detected_val - image_center) < SINGLE_LINE_CENTER_THRESHOLD:
+            steering_angle = last_steering_angle
+            print(f"Solo linea destra rilevata ({R_bot_x_detected_val:.1f}), ma troppo vicina al centro. Mantengo angolo {last_steering_angle:.1f}")
+        else:
+            # Right line is detected and not too close to center, use calculated angle
+            print(f"Solo linea destra rilevata. Larghezza stimata: {lane_width:.1f}, Angolo calcolato: {steering_angle:.1f}")
 
 
     # Apply the steering angle and speed to the PicarX
