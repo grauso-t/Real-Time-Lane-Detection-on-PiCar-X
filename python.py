@@ -1,270 +1,545 @@
+import cv2
 import time
 import numpy as np
 from picamera2 import Picamera2
 from picarx import Picarx
-import cv2
 
-# === Control Parameters ===
-# Metodo di sterzata da utilizzare. Le opzioni includono 'linear', 'exponential', 'sigmoid', 'quadratic'.
-# 'exponential' offre una risposta più aggressiva per piccole deviazioni.
-STEERING_METHOD = 'exponential'
-# Fattore di smoothing per l'angolo di sterzata. Un valore più alto (es. 0.9) porta a sterzate più lente e fluide,
-# ma anche a una risposta più lenta. Un valore più basso (es. 0.5) rende la sterzata più reattiva.
-SMOOTHING_FACTOR = 0.7
-# Velocità del veicolo. Impostato a 0 inizialmente e successivamente con px.forward(SPEED).
-SPEED = 0
-# Variabile per memorizzare l'ultimo angolo di sterzata valido, utilizzata per lo smoothing e
-# per mantenere una direzione in assenza di linee rilevate.
-last_valid_steering_angle = 0.0
-
-# Larghezza minima della carreggiata (in pixel nella vista bird-eye) per considerare le linee valide.
-# Se la larghezza calcolata è inferiore a questo valore, l'angolo di sterzata precedente verrà mantenuto.
-MIN_LANE_WIDTH_PIXELS = 180
-
-# === Setup PiCar-X ===
-# Inizializza l'oggetto Picarx per controllare il veicolo.
-px = Picarx()
-# Imposta la velocità iniziale del motore a 0 (fermo).
-px.forward(0)
-
-# === Setup Camera ===
-# Inizializza l'oggetto Picamera2 per acquisire immagini.
-picam2 = Picamera2()
-# Configura la camera per acquisire immagini con una risoluzione di 640x480 pixel.
+px = Picarx()  # Inizializza il controllo del veicolo
+picam2 = Picamera2()  # Inizializza l'oggetto Picamera2 per acquisire immagini.
 picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
-# Avvia la cattura delle immagini dalla camera.
 picam2.start()
-# Attende 2 secondi per permettere alla camera di avviarsi e scaldarsi.
 time.sleep(2)
 
-# Imposta la velocità di movimento del veicolo dopo l'avvio della camera.
-px.forward(SPEED)
+# === VARIABILI DI STATO ===
+# Memorizzano gli ultimi valori validi per garantire continuità nel controllo
+last_valid_steering_angle = 0.0      # Ultimo angolo di sterzata valido complessivo
+last_valid_left_angle = None         # Ultimo angolo della linea sinistra valido
+last_valid_right_angle = None        # Ultimo angolo della linea destra valido
 
-# === Steering Function ===
-# Funzione per calcolare l'angolo di sterzata basandosi sulla pendenza rilevata della corsia.
-# 'slope': La pendenza media calcolata delle linee della corsia (più ripida = più deviazione).
-# 'method': Il metodo di mappatura della pendenza all'angolo di sterzata.
+# === PARAMETRI DI CONFIGURAZIONE ===
+STEERING_METHOD = 'hybrid_deSantis'      # Metodo di calcolo angolo: 'linear', 'exponential', 'sigmoid', 'quadratic'
+SMOOTHING_FACTOR = 0              # Fattore di smoothing (0-1): più alto = transizioni più morbide
+MIN_LANE_WIDTH = 180                # Larghezza minima carreggiata in pixel per considerarla valida
+SPEED = 1                       # Velocità del veicolo (puoi regolare in base al tuo setup)
+
+px.forward(SPEED)  # Avvia il veicolo in avanti
+
+def create_info_panel(width=400, height=600):
+    """
+    Crea un pannello informativo con sfondo nero
+    
+    Args:
+        width: Larghezza del pannello
+        height: Altezza del pannello
+    
+    Returns:
+        Immagine numpy con sfondo nero
+    """
+    return np.zeros((height, width, 3), dtype=np.uint8)
+
+def add_text_to_panel(panel, text, position, font_scale=0.6, color=(255, 255, 255), thickness=1):
+    """
+    Aggiunge testo al pannello informativo
+    
+    Args:
+        panel: Immagine del pannello
+        text: Testo da aggiungere
+        position: Tupla (x, y) della posizione
+        font_scale: Dimensione del font
+        color: Colore del testo (B, G, R)
+        thickness: Spessore del testo
+    """
+    cv2.putText(panel, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+
+def add_section_title(panel, title, y_pos, color=(0, 255, 255)):
+    """
+    Aggiunge un titolo di sezione al pannello
+    
+    Args:
+        panel: Immagine del pannello
+        title: Titolo della sezione
+        y_pos: Posizione verticale
+        color: Colore del titolo
+    
+    Returns:
+        Nuova posizione y per il contenuto della sezione
+    """
+    # Linea separatrice sopra il titolo
+    cv2.line(panel, (10, y_pos - 5), (390, y_pos - 5), color, 1)
+    
+    # Titolo
+    add_text_to_panel(panel, title, (10, y_pos + 15), font_scale=0.7, color=color, thickness=2)
+    
+    return y_pos + 35
+
 def calculate_steering_angle(slope, method='exponential'):
-    # Limita la pendenza tra -2.0 e 2.0 per evitare valori estremi che potrebbero causare sterzate brusche.
+    """
+    Calcola l'angolo di sterzata basato sulla pendenza con diverse modalità di risposta
+    
+    Args:
+        slope: Pendenza della linea calcolata come (y2-y1)/(x2-x1)
+        method: Metodo di calcolo - 'linear', 'exponential', 'sigmoid', 'quadratic'
+    
+    Returns:
+        Angolo di sterzata in gradi nel range [-45, 45]
+    """
+    # Limita la pendenza per evitare valori estremi che potrebbero causare comportamenti erratici
     slope = np.clip(slope, -2.0, 2.0)
+    
     if method == 'linear':
-        # Metodo lineare: l'angolo di sterzata è direttamente proporzionale alla pendenza normalizzata.
-        # Normalizza la pendenza dividendo per 0.5 e limitandola tra -1.0 e 1.0.
+        # Mappatura lineare classica: pendenza -> angolo
+        # Normalizza la pendenza dividendo per 0.5 (pendenza di riferimento)
         normalized_slope = np.clip(slope / 0.5, -1.0, 1.0)
-        # L'angolo massimo di sterzata è ±45 gradi.
-        return normalized_slope * 45.0
-    elif method == 'exponential':
-        # Metodo esponenziale: la risposta di sterzata aumenta più rapidamente con l'aumentare della pendenza.
-        # Offre una maggiore sensibilità per piccole deviazioni.
-        normalized_slope = slope / 0.5
-        # Determina il segno della pendenza per mantenere la direzione di sterzata.
-        sign = np.sign(normalized_slope)
-        abs_normalized = abs(normalized_slope)
-        # Calcola la risposta esponenziale. Il denominatore normalizza il risultato tra 0 e 1.
-        exponential_response = (np.exp(abs_normalized * 1.5) - 1) / (np.exp(1.5) - 1) if abs_normalized <= 1.0 else 1.0
-        return sign * exponential_response * 45.0
+        return normalized_slope * 45.0  # Scala all'angolo massimo di 45°
+        
+    elif method == 'hybrid_deSantis':
+        # Ritorno angolo di sterzata precedente se la pendenza è zero
+        if slope == 0 or slope is None:
+            return last_valid_steering_angle
+
+        if abs(slope) >= 0.6:
+            # Applica direttamente l'angolo massimo
+            return np.sign(slope) * 45.0
+        else:
+            # Risposta esponenziale per pendenze più contenute
+            normalized_slope = slope / 0.5
+            sign = np.sign(normalized_slope)
+            abs_normalized = abs(normalized_slope)
+            
+            if abs_normalized <= 1.0:
+                exponential_response = (np.exp(abs_normalized * 1.5) - 1) / (np.exp(1.5) - 1)
+            else:
+                exponential_response = 1.0
+            
+            return sign * exponential_response * 45.0
+        
     elif method == 'sigmoid':
-        # Metodo sigmoide: una curva a "S" che offre una risposta graduale all'inizio,
-        # poi più ripida e infine si appiattisce.
-        k = 3.0 # Fattore di ripidità della curva sigmoide.
+        # Risposta sigmoidale - transizione smooth ma con crescita rapida al centro
+        # Buona per avere controllo fine ma reattività quando necessario
+        k = 3.0  # Fattore di steepness (ripidità della curva)
         sigmoid_response = 2 / (1 + np.exp(-k * slope)) - 1
         return sigmoid_response * 45.0
+        
     elif method == 'quadratic':
-        # Metodo quadratico: la risposta di sterzata aumenta più rapidamente man mano che la pendenza aumenta.
+        # Risposta quadratica - crescita progressiva, più dolce degli altri metodi
         normalized_slope = np.clip(slope / 0.5, -1.0, 1.0)
         sign = np.sign(normalized_slope)
-        quadratic_response = normalized_slope ** 2 # La risposta è il quadrato della pendenza normalizzata.
-        return sign * quadratic_response * 45.0
+        quadratic_response = normalized_slope ** 2  # Eleva al quadrato per curva parabolica
+        return sign * quadratic_response * 45.0 
+
     else:
-        # Se il metodo specificato non è valido, usa 'exponential' come predefinito.
+        # Fallback al metodo esponenziale se il metodo specificato non è riconosciuto
         return calculate_steering_angle(slope, 'exponential')
 
-try:
-    # Ciclo principale di elaborazione del frame.
-    while True:
-        # Acquisisce un frame dall'array della camera.
-        frame = picam2.capture_array()
-        # Ottiene altezza (h) e larghezza (w) del frame.
-        h, w = frame.shape[:2]
-        # Definisce la regione di interesse (ROI) nella parte inferiore del frame,
-        # dove si presume che le linee della corsia siano più visibili e pertinenti.
-        roi_top, roi_bottom = int(h * 0.6), h
-
-        # === Bird-eye transform (Trasformazione a occhio d'uccello) ===
-        # Definisce i punti sorgente (ROI nel frame originale) per la trasformazione prospettica.
-        # Questi punti rappresentano gli angoli del trapezio nel frame originale.
-        src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bottom], [0, roi_bottom]])
-        # Definisce le dimensioni desiderate per l'immagine trasformata (larghezza, altezza).
-        dst_w, dst_h = 300, 200
-        # Definisce i punti di destinazione (un rettangolo nell'immagine trasformata) per la trasformazione.
-        dst = np.float32([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]])
-        # Calcola la matrice di trasformazione prospettica dai punti sorgente e destinazione.
-        matrix = cv2.getPerspectiveTransform(src, dst)
-        # Applica la trasformazione prospettica al frame, ottenendo la vista a occhio d'uccello.
-        bird_eye = cv2.warpPerspective(frame, matrix, (dst_w, dst_h))
-
-        # === Elaborazione delle immagini per il rilevamento delle linee ===
-        # Converte l'immagine da BGR a HSV (Hue, Saturation, Value) per una migliore segmentazione del colore.
-        hsv = cv2.cvtColor(bird_eye, cv2.COLOR_BGR2HSV)
-        # Crea una maschera per rilevare i colori bianchi.
-        # np.array([0, 0, 200]) è il limite inferiore HSV per il bianco.
-        # np.array([180, 30, 255]) è il limite superiore HSV per il bianco.
-        mask_white = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 30, 255]))
-        # Crea una maschera per rilevare i colori gialli.
-        # np.array([20, 100, 100]) è il limite inferiore HSV per il giallo.
-        # np.array([30, 255, 255]) è il limite superiore HSV per il giallo.
-        mask_yellow = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([30, 255, 255]))
-        # Combina le due maschere (bianco e giallo) usando l'operazione OR bit a bit.
-        mask = cv2.bitwise_or(mask_white, mask_yellow)
-        # Applica un filtro gaussiano per sfocare l'immagine e ridurre il rumore.
-        # (5, 5) è la dimensione del kernel, 0 è la deviazione standard in X (calcolata automaticamente).
-        blurred = cv2.GaussianBlur(mask, (5, 5), 0)
-        # Applica l'algoritmo Canny per rilevare i bordi.
-        # 50 e 150 sono i valori di soglia bassa e alta per il rilevamento dei bordi.
-        edges = cv2.Canny(blurred, 50, 150)
-
-        # === Rilevamento linee con HoughLinesP ===
-        # Applica la Trasformata di Hough Probabilistica per rilevare le linee nell'immagine dei bordi.
-        # 'edges': Immagine binaria dei bordi.
-        # 1: Risoluzione del raggio in pixel.
-        # np.pi / 180: Risoluzione dell'angolo in radianti (1 grado).
-        # threshold=50: Numero minimo di intersezioni per essere considerato una linea.
-        # minLineLength=20: Lunghezza minima della linea per essere rilevata.
-        # maxLineGap=30: Distanza massima tra segmenti di linea per considerarli un'unica linea.
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=20, maxLineGap=30)
-        # Liste per memorizzare le linee di corsia sinistra e destra.
-        left_lines, right_lines = [], []
-
-        # Crea un'immagine nera vuota per disegnare le linee rilevate e visualizzarle.
-        line_image = np.zeros_like(bird_eye)
-
-        if lines is not None:
-            for line in lines:
-                # Estrae le coordinate dei punti di inizio e fine della linea.
-                x1, y1, x2, y2 = line[0]
-                # Calcola la pendenza della linea. Aggiunge 1e-6 per evitare divisioni per zero.
-                slope = (y2 - y1) / (x2 - x1 + 1e-6)
-                # Ignora le linee con pendenza quasi orizzontale (pendenza assoluta minore di 0.5),
-                # poiché non rappresentano le linee di corsia.
-                if abs(slope) < 0.5:
-                    continue
-                # Classifica la linea come "sinistra" se la pendenza è negativa (inclinata verso l'alto a sinistra)
-                # o "destra" se la pendenza è positiva (inclinata verso l'alto a destra).
-                (left_lines if slope < 0 else right_lines).append((x1, y1, x2, y2))
-
-        # === Funzione per ottenere la pendenza media e i punti della linea ===
-        # 'lines': Lista di segmenti di linea (x1, y1, x2, y2).
-        def get_avg_slope(lines):
-            if not lines:
-                # Se non ci sono linee, restituisce None per pendenza e coordinate.
-                return None, None
-            x_coords, y_coords = [], []
-            # Raccoglie tutte le coordinate x e y da tutti i segmenti di linea.
-            for x1, y1, x2, y2 in lines:
-                x_coords += [x1, x2]
-                y_coords += [y1, y2]
-            if not x_coords:
-                return None, None
-            # Esegue una regressione lineare (fit polinomiale di grado 1) per trovare la linea media.
-            # `poly[0]` sarà la pendenza e `poly[1]` l'intercetta y.
-            poly = np.polyfit(y_coords, x_coords, deg=1)
-            # Calcola i punti x per disegnare la linea media, basandosi sui valori min e max di y.
-            min_y = min(y_coords)
-            max_y = max(y_coords)
-            fit_x1 = int(poly[0] * min_y + poly[1])
-            fit_x2 = int(poly[0] * max_y + poly[1])
-            # Restituisce la pendenza e le coordinate (x1, y1, x2, y2) della linea media.
-            return poly[0], (fit_x1, min_y, fit_x2, max_y)
-
-        # Calcola la pendenza media e le coordinate per le linee di corsia sinistra e destra.
-        left_slope, left_line_coords = get_avg_slope(left_lines)
-        right_slope, right_line_coords = get_avg_slope(right_lines)
-
-        angles = []
-        lane_width = 0 # Inizializza la larghezza della carreggiata
+def validate_lane_geometry(left_poly, right_poly, dst_w, dst_h, min_lane_width=180):
+    """
+    Valida la geometria delle linee rilevate per assicurarsi che abbiano senso
+    dal punto di vista della guida reale
+    
+    Args:
+        left_poly: Coefficienti del polinomio della linea sinistra (None se non rilevata)
+        right_poly: Coefficienti del polinomio della linea destra (None se non rilevata)
+        dst_w: Larghezza dell'immagine bird-eye view
+        dst_h: Altezza dell'immagine bird-eye view
+        min_lane_width: Larghezza minima accettabile della carreggiata in pixel
         
-        # Inizializza le coordinate x medie delle linee per il calcolo della larghezza
-        left_line_x_avg = None
-        right_line_x_avg = None
+    Returns:
+        tuple: (is_valid, lane_width, error_message)
+            - is_valid: True se la geometria è valida
+            - lane_width: Larghezza della carreggiata in pixel (0 se non calcolabile)
+            - error_message: Descrizione del risultato della validazione
+    """
+    center_x = dst_w // 2  # Centro orizzontale dell'immagine
+    y_test = dst_h // 2    # Punto verticale per testare le posizioni delle linee
+    
+    if left_poly is not None and right_poly is not None:
+        # Caso: entrambe le linee sono state rilevate
+        
+        # Calcola le posizioni x delle linee al punto di test
+        x_left = np.polyval(left_poly, y_test)   # Posizione x della linea sinistra
+        x_right = np.polyval(right_poly, y_test) # Posizione x della linea destra
+        
+        # Controllo 1: La linea sinistra deve essere effettivamente a sinistra del centro
+        if x_left >= center_x:
+            return False, 0, "Linea sinistra a destra del centro"
+        
+        # Controllo 2: La linea destra deve essere effettivamente a destra del centro
+        if x_right <= center_x:
+            return False, 0, "Linea destra a sinistra del centro"
+        
+        # Controllo 3: Calcola larghezza carreggiata e verifica che sia ragionevole
+        lane_width = x_right - x_left
+        if lane_width < min_lane_width:
+            return False, lane_width, f"Carreggiata stretta: {lane_width:.1f}px"
+        
+        # Tutti i controlli superati
+        return True, lane_width, "Geometria valida"
+    
+    elif left_poly is not None:
+        # Caso: solo linea sinistra rilevata
+        x_left = np.polyval(left_poly, y_test)
+        if x_left >= center_x:
+            return False, 0, "Linea sinistra a destra del centro"
+        return True, 0, "Solo linea sinistra valida"
+    
+    elif right_poly is not None:
+        # Caso: solo linea destra rilevata
+        x_right = np.polyval(right_poly, y_test)
+        if x_right <= center_x:
+            return False, 0, "Linea destra a sinistra del centro"
+        return True, 0, "Solo linea destra valida"
+    
+    # Caso: nessuna linea rilevata
+    return False, 0, "Nessuna linea rilevata"
 
-        # Se sono state rilevate linee di corsia sinistra:
-        if left_line_coords:
-            # Disegna la linea di corsia sinistra sull'immagine `line_image` in blu.
-            cv2.line(line_image, (left_line_coords[0], left_line_coords[1]), (left_line_coords[2], left_line_coords[3]), (255, 0, 0), 5)
-            # Calcola l'angolo di sterzata basandosi sulla pendenza della corsia sinistra.
-            angle = calculate_steering_angle(left_slope, STEERING_METHOD)
-            angles.append(angle)
-            # Visualizza la pendenza della corsia sinistra sull'immagine.
-            cv2.putText(line_image, f"L Slope: {left_slope:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            # Calcola la coordinata x media della linea sinistra a metà altezza dell'immagine bird-eye
-            left_line_x_avg = int((left_line_coords[0] + left_line_coords[2]) / 2)
+# === CICLO PRINCIPALE DI ELABORAZIONE ===
+while True:
+    # Leggi il prossimo frame dal video
+    frame = picam2.capture_array()
+    
+    # === PREPARAZIONE DELL'IMMAGINE ===
+    h, w = frame.shape[:2]  # Dimensioni del frame originale
+    
+    # Definisce la ROI (Region of Interest) - la parte bassa del frame dove sono le linee
+    roi_top, roi_bottom = int(h * 0.6), h  # Dal 60% in giù dell'immagine
+    
+    # === TRASFORMAZIONE PROSPETTICA (BIRD-EYE VIEW) ===
+    # Definisce i punti sorgente (trapezio della strada nel frame originale)
+    src = np.float32([[0, roi_top], [w, roi_top], [w, roi_bottom], [0, roi_bottom]])
+    
+    # Definisce le dimensioni e i punti di destinazione (rettangolo della bird-eye view)
+    dst_w, dst_h = 300, 200
+    dst = np.float32([[0, 0], [dst_w, 0], [dst_w, dst_h], [0, dst_h]])
+    
+    # Calcola la matrice di trasformazione e applica la trasformazione
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    bird_eye = cv2.warpPerspective(frame, matrix, (dst_w, dst_h))
+    
+    # === CONVERSIONE SPAZIO COLORE E CREAZIONE MASCHERE ===
+    hsv = cv2.cvtColor(bird_eye, cv2.COLOR_BGR2HSV)
+    
+    # Maschera per linee bianche (alta luminosità, bassa saturazione)
+    lower_white = np.array([0, 0, 200])      # H, S, V minimi
+    upper_white = np.array([180, 30, 255])   # H, S, V massimi
+    mask_white = cv2.inRange(hsv, lower_white, upper_white)
+    
+    # Maschera per linee gialle (tonalità gialla)
+    lower_yellow = np.array([20, 100, 100])  # H, S, V minimi
+    upper_yellow = np.array([30, 255, 255])  # H, S, V massimi
+    mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    
+    # Combina le due maschere per rilevare sia linee bianche che gialle
+    mask = cv2.bitwise_or(mask_white, mask_yellow)
+    
+    # === PREPROCESSING PER RILEVAMENTO LINEE ===
+    # Applica filtro gaussiano per ridurre il rumore
+    blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+    
+    # Rilevamento bordi con algoritmo Canny
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # === RILEVAMENTO LINEE CON HOUGH TRANSFORM ===
+    lines = cv2.HoughLinesP(
+        edges,              # Immagine dei bordi
+        1,                  # Risoluzione in pixel
+        np.pi / 180,        # Risoluzione angolare in radianti
+        threshold=50,       # Soglia minima per considerare una linea
+        minLineLength=20,   # Lunghezza minima della linea
+        maxLineGap=30       # Gap massimo tra segmenti per considerarli una linea continua
+    )
+    
+    # Inizializza immagine per il disegno e liste per le linee
+    line_img = bird_eye.copy()
+    left_lines = []   # Lista per linee con pendenza negativa (linee sinistre)
+    right_lines = []  # Lista per linee con pendenza positiva (linee destre)
+    
+    # === CLASSIFICAZIONE DELLE LINEE ===
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]  # Coordinate degli estremi della linea
+            
+            # Calcola la pendenza, evitando divisione per zero
+            slope = (y2 - y1) / (x2 - x1 + 1e-6)
+            
+            # Filtra linee troppo orizzontali (pendenza bassa)
+            if abs(slope) < 0.5:
+                continue
+            
+            # Classifica in base alla pendenza
+            if slope < 0:
+                left_lines.append((x1, y1, x2, y2))   # Pendenza negativa = linea sinistra
+            else:
+                right_lines.append((x1, y1, x2, y2))  # Pendenza positiva = linea destra
 
+    def draw_average_line(lines, color, label):
+        """
+        Calcola e restituisce il polinomio medio di un insieme di linee
+        
+        Args:
+            lines: Lista di tuple (x1, y1, x2, y2) rappresentanti le linee
+            color: Colore per il disegno (non utilizzato in questa versione)
+            label: Etichetta per debug ("Left" o "Right")
+            
+        Returns:
+            tuple: (poly, slope, steering_angle)
+                - poly: Coefficienti del polinomio della linea media
+                - slope: Pendenza della linea media
+                - steering_angle: Angolo di sterzata calcolato
+        """
+        if lines:
+            # Raccoglie tutte le coordinate dei punti delle linee
+            x_coords = []
+            y_coords = []
+            for x1, y1, x2, y2 in lines:
+                x_coords += [x1, x2]  # Aggiunge entrambi gli estremi
+                y_coords += [y1, y2]
+            
+            if len(x_coords) > 0:
+                # Calcola il polinomio di primo grado che meglio approssima i punti
+                # Nota: polyfit(y, x) perché vogliamo x in funzione di y (x = m*y + b)
+                poly = np.polyfit(y_coords, x_coords, deg=1)
+                slope = poly[0]  # Il coefficiente angolare m
+                
+                # Calcola l'angolo di sterzata basato sulla pendenza
+                raw_steering_angle = calculate_steering_angle(slope, STEERING_METHOD)
+                
+                # === SMOOTHING TEMPORALE ===
+                # Applica smoothing se abbiamo un valore precedente valido
+                if label == 'Left' and last_valid_left_angle is not None:
+                    steering_angle = (SMOOTHING_FACTOR * last_valid_left_angle + 
+                                    (1 - SMOOTHING_FACTOR) * raw_steering_angle)
+                elif label == 'Right' and last_valid_right_angle is not None:
+                    steering_angle = (SMOOTHING_FACTOR * last_valid_right_angle + 
+                                    (1 - SMOOTHING_FACTOR) * raw_steering_angle)
+                else:
+                    steering_angle = raw_steering_angle
+                
+                return poly, slope, steering_angle
+        
+        # Nessuna linea trovata
+        return None, None, None
 
-        # Se sono state rilevate linee di corsia destra:
-        if right_line_coords:
-            # Disegna la linea di corsia destra sull'immagine `line_image` in rosso.
-            cv2.line(line_image, (right_line_coords[0], right_line_coords[1]), (right_line_coords[2], right_line_coords[3]), (0, 0, 255), 5)
-            # Calcola l'angolo di sterzata basandosi sulla pendenza della corsia destra.
-            angle = calculate_steering_angle(right_slope, STEERING_METHOD)
-            angles.append(angle)
-            # Visualizza la pendenza della corsia destra sull'immagine.
-            cv2.putText(line_image, f"R Slope: {right_slope:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            # Calcola la coordinata x media della linea destra a metà altezza dell'immagine bird-eye
-            right_line_x_avg = int((right_line_coords[0] + right_line_coords[2]) / 2)
+    # === CALCOLO DEI POLINOMI DELLE LINEE ===
+    left_poly, left_slope, left_angle = draw_average_line(left_lines, (255, 0, 0), "Left")
+    right_poly, right_slope, right_angle = draw_average_line(right_lines, (0, 0, 255), "Right")
 
-        # Calcola la larghezza della carreggiata se entrambe le linee sono state rilevate
-        if left_line_x_avg is not None and right_line_x_avg is not None:
-            lane_width = abs(right_line_x_avg - left_line_x_avg)
-            cv2.putText(line_image, f"Width: {lane_width} px", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1) # Giallo per la larghezza
+    # === VALIDAZIONE GEOMETRICA ===
+    # Controlla se la geometria delle linee rilevate ha senso
+    geometry_valid, lane_width, validation_message = validate_lane_geometry(
+        left_poly, right_poly, dst_w, dst_h, MIN_LANE_WIDTH
+    )
+    
+    # === INIZIALIZZAZIONE VARIABILI PER IL DISPLAY ===
+    current_steering_angle = None
+    
+    # === GESTIONE BASATA SULLA VALIDITÀ DELLA GEOMETRIA ===
+    if geometry_valid:
+        # *** GEOMETRIA VALIDA - PROCEDI CON AGGIORNAMENTO ***
+        
+        # Disegna la linea sinistra se rilevata
+        if left_poly is not None:
+            y_start, y_end = 0, dst_h  # Estremi verticali per il disegno
+            x_start = int(np.polyval(left_poly, y_start))  # x corrispondente a y_start
+            x_end = int(np.polyval(left_poly, y_end))      # x corrispondente a y_end
+            cv2.line(line_img, (x_start, y_start), (x_end, y_end), (255, 0, 0), 3)  # Blu
+        
+        # Disegna la linea destra se rilevata
+        if right_poly is not None:
+            y_start, y_end = 0, dst_h
+            x_start = int(np.polyval(right_poly, y_start))
+            x_end = int(np.polyval(right_poly, y_end))
+            cv2.line(line_img, (x_start, y_start), (x_end, y_end), (0, 0, 255), 3)  # Rosso
+        
+        # === CALCOLO NUOVO ANGOLO DI STERZATA ===
+        if left_angle is not None and right_angle is not None:
+            # Entrambe le linee: media degli angoli
+            current_steering_angle = (left_angle + right_angle) / 2
+            last_valid_left_angle = left_angle    # Aggiorna ultimo valore valido
+            last_valid_right_angle = right_angle  # Aggiorna ultimo valore valido
+        elif left_angle is not None:
+            # Solo linea sinistra
+            current_steering_angle = left_angle
+            last_valid_left_angle = left_angle
+        elif right_angle is not None:
+            # Solo linea destra
+            current_steering_angle = right_angle
+            last_valid_right_angle = right_angle
+    
+    else:
+        # *** GEOMETRIA NON VALIDA - MANTIENI VALORI PRECEDENTI ***
+        
+        # Non aggiornare l'angolo, mantieni l'ultimo valore valido
+        current_steering_angle = last_valid_steering_angle
+        
+        # Disegna comunque le linee rilevate ma in grigio per indicare che sono invalide
+        if left_poly is not None:
+            y_start, y_end = 0, dst_h
+            x_start = int(np.polyval(left_poly, y_start))
+            x_end = int(np.polyval(left_poly, y_end))
+            cv2.line(line_img, (x_start, y_start), (x_end, y_end), (100, 100, 100), 2)  # Grigio
+        
+        if right_poly is not None:
+            y_start, y_end = 0, dst_h
+            x_start = int(np.polyval(right_poly, y_start))
+            x_end = int(np.polyval(right_poly, y_end))
+            cv2.line(line_img, (x_start, y_start), (x_end, y_end), (100, 100, 100), 2)  # Grigio
 
-        # Calcola l'angolo di sterzata corrente.
-        if angles and lane_width > MIN_LANE_WIDTH_PIXELS:
-            # Se sono stati calcolati angoli e la carreggiata è sufficientemente larga, ne fa la media.
-            current_steering_angle = sum(angles) / len(angles)
+    # === GESTIONE CASO INIZIALE ===
+    # Se non abbiamo un angolo corrente (primo frame o nessuna linea mai rilevata)
+    if current_steering_angle is None:
+        current_steering_angle = last_valid_steering_angle
+
+    # === SMOOTHING GLOBALE FINALE ===
+    # Applica smoothing aggiuntivo all'angolo di sterzata finale per maggiore stabilità
+    if current_steering_angle is not None and current_steering_angle != last_valid_steering_angle:
+        if last_valid_steering_angle != 0.0:
+            # Smoothing più aggressivo per l'angolo finale
+            final_steering_angle = (SMOOTHING_FACTOR * 1.2 * last_valid_steering_angle + 
+                                  (1 - SMOOTHING_FACTOR * 1.2) * current_steering_angle)
         else:
-            # Se non sono state rilevate linee valide o la carreggiata è troppo stretta,
-            # mantiene l'ultimo angolo di sterzata valido.
-            current_steering_angle = last_valid_steering_angle
-            if lane_width <= MIN_LANE_WIDTH_PIXELS and lane_width != 0:
-                cv2.putText(line_image, "Lane too narrow!", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1) # Rosso per avviso
+            final_steering_angle = current_steering_angle
+        
+        # Aggiorna il valore memorizzato
+        last_valid_steering_angle = final_steering_angle
+    else:
+        final_steering_angle = last_valid_steering_angle
 
-        # Applica lo smoothing all'angolo di sterzata finale.
-        # Combina l'ultimo angolo valido con l'angolo corrente per una transizione più fluida.
-        final_angle = (SMOOTHING_FACTOR * 1.2 * last_valid_steering_angle +
-                       (1 - SMOOTHING_FACTOR * 1.2) * current_steering_angle)
-        # Aggiorna l'ultimo angolo di sterzata valido.
-        last_valid_steering_angle = final_angle
+    px.set_dir_servo_angle(final_steering_angle)  # Imposta l'angolo di sterzata al veicolo
 
-        # Invia l'angolo di sterzata calcolato al servo del PicarX.
-        # L'angolo deve essere un intero.
-        px.set_dir_servo_angle(int(final_angle))
+    # === STIMA DEL CENTRO CORSIA ===
+    # Calcola la posizione del centro della corsia per la visualizzazione
+    lane_width_px = 300  # Larghezza standard stimata in pixel
+    y_pos = dst_h // 3   # Altezza a cui calcolare il centro
+    
+    if geometry_valid:
+        # Usa la geometria attuale se valida
+        if left_poly is not None and right_poly is not None:
+            # Entrambe le linee: centro tra le due
+            x_left = int(np.polyval(left_poly, y_pos))
+            x_right = int(np.polyval(right_poly, y_pos))
+            lane_center = (x_left + x_right) // 2
+        elif left_poly is not None:
+            # Solo linea sinistra: stima il centro aggiungendo metà larghezza standard
+            x_left = int(np.polyval(left_poly, y_pos))
+            lane_center = x_left + lane_width_px // 2
+        elif right_poly is not None:
+            # Solo linea destra: stima il centro sottraendo metà larghezza standard
+            x_right = int(np.polyval(right_poly, y_pos))
+            lane_center = x_right - lane_width_px // 2
+        else:
+            # Nessuna linea valida: usa il centro dell'immagine
+            lane_center = dst_w // 2
+    else:
+        # Geometria non valida: usa il centro dell'immagine come fallback
+        lane_center = dst_w // 2
 
-        # === Visualizzazione Debug ===
-        # Sovrappone l'immagine delle linee (`line_image`) sulla vista a occhio d'uccello (`bird_eye`).
-        # 0.8 e 1 sono i pesi (alfa) per la fusione delle due immagini.
-        combined_view = cv2.addWeighted(bird_eye, 0.8, line_image, 1, 0)
-        # Visualizza l'angolo di sterzata finale sulla vista combinata.
-        cv2.putText(combined_view, f"Steering: {final_angle:.1f} deg", (10, dst_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # === VISUALIZZAZIONE CENTRO CORSIA ===
+    # Colore diverso in base alla validità della geometria
+    center_color = (0, 255, 255) if geometry_valid else (100, 100, 100)  # Giallo se valido, grigio se invalido
+    
+    # Disegna il punto centrale e la linea verticale
+    cv2.circle(line_img, (lane_center, y_pos), 5, center_color, -1)            # Cerchio
+    cv2.line(line_img, (lane_center, 0), (lane_center, dst_h), center_color, 2) # Linea verticale
 
-        # Mostra la vista a occhio d'uccello con le linee e l'angolo di sterzata.
-        cv2.imshow("Bird-Eye View with Lanes", combined_view)
-        # Mostra l'immagine dei bordi per ulteriore debugging.
-        cv2.imshow("Edges", edges)
+    # === CREAZIONE PANNELLO INFORMATIVO ===
+    info_panel = create_info_panel(400, 800)
+    
+    # Posizione verticale corrente per il testo
+    current_y = 30
+      
+    # === SEZIONE LINEA SINISTRA ===
+    current_y = add_section_title(info_panel, "LINEA SINISTRA", current_y, (255, 100, 100))
+    if left_poly is not None:
+        add_text_to_panel(info_panel, f"Rilevata: SI", (20, current_y), color=(0, 255, 0))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Pendenza: {left_slope:.3f}", (20, current_y))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Angolo: {left_angle:.1f}", (20, current_y))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Ultimo Valid: {last_valid_left_angle:.1f}" if last_valid_left_angle else "Ultimo Valid: N/A", (20, current_y))
+    else:
+        add_text_to_panel(info_panel, f"Rilevata: NO", (20, current_y), color=(0, 0, 255))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Ultimo Valid: {last_valid_left_angle:.1f}" if last_valid_left_angle else "Ultimo Valid: N/A", (20, current_y))
+    current_y += 40
+    
+    # === SEZIONE LINEA DESTRA ===
+    current_y = add_section_title(info_panel, "LINEA DESTRA", current_y, (100, 100, 255))
+    if right_poly is not None:
+        add_text_to_panel(info_panel, f"Rilevata: SI", (20, current_y), color=(0, 255, 0))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Pendenza: {right_slope:.3f}", (20, current_y))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Angolo: {right_angle:.1f}", (20, current_y))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Ultimo Valid: {last_valid_right_angle:.1f}" if last_valid_right_angle else "Ultimo Valid: N/A", (20, current_y))
+    else:
+        add_text_to_panel(info_panel, f"Rilevata: NO", (20, current_y), color=(0, 0, 255))
+        current_y += 25
+        add_text_to_panel(info_panel, f"Ultimo Valid: {last_valid_right_angle:.1f}" if last_valid_right_angle else "Ultimo Valid: N/A", (20, current_y))
+    current_y += 40
+    
+    # === SEZIONE VALIDAZIONE GEOMETRICA ===
+    current_y = add_section_title(info_panel, "VALIDAZIONE GEOMETRICA", current_y, (255, 255, 100))
+    validation_color = (0, 255, 0) if geometry_valid else (0, 0, 255)
+    add_text_to_panel(info_panel, f"Stato: {'VALIDA' if geometry_valid else 'INVALIDA'}", (20, current_y), color=validation_color)
+    current_y += 25
+    add_text_to_panel(info_panel, f"Messaggio: {validation_message}", (20, current_y), font_scale=0.5)
+    current_y += 25
+    if lane_width > 0:
+        add_text_to_panel(info_panel, f"Larghezza Corsia: {lane_width:.1f}px", (20, current_y))
+    else:
+        add_text_to_panel(info_panel, f"Larghezza Corsia: N/A", (20, current_y))
+    current_y += 40
+    
+    # === SEZIONE CONTROLLO STERZATA ===
+    current_y = add_section_title(info_panel, "CONTROLLO STERZATA", current_y, (100, 255, 255))
+    add_text_to_panel(info_panel, f"Angolo Finale: {final_steering_angle:.1f}", (20, current_y), 
+                     font_scale=0.8, thickness=2, color=(255, 255, 255))
+    current_y += 30
+    add_text_to_panel(info_panel, f"Angolo Corrente: {current_steering_angle:.1f}" if current_steering_angle else "Angolo Corrente: N/A", (20, current_y))
+    current_y += 25
+    add_text_to_panel(info_panel, f"Ultimo Valido: {last_valid_steering_angle:.1f}", (20, current_y))
+    current_y += 40
+    
+    # === SEZIONE CENTRO CORSIA ===
+    current_y = add_section_title(info_panel, "CENTRO CORSIA", current_y, (255, 255, 0))
+    add_text_to_panel(info_panel, f"Posizione X: {lane_center}px", (20, current_y))
+    current_y += 25
+    add_text_to_panel(info_panel, f"Centro Immagine: {dst_w // 2}px", (20, current_y))
+    current_y += 25
+    offset = lane_center - (dst_w // 2)
+    offset_direction = "DESTRA" if offset > 0 else "SINISTRA"
+    add_text_to_panel(info_panel, f"Offset: {abs(offset)}px {offset_direction}", (20, current_y))
+    current_y += 40
+    
+    # Stato del sistema
+    if geometry_valid:
+        system_status = "OPERATIVO"
+        status_color = (0, 255, 0)
+    else:
+        system_status = "FALLBACK"
+        status_color = (255, 165, 0)
+    
+    add_text_to_panel(info_panel, f"Stato Sistema: {system_status}", (20, current_y + 10), 
+                     font_scale=0.7, color=status_color, thickness=2)
 
-        # Controlla se il tasto 'q' è stato premuto per uscire dal ciclo.
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    # === VISUALIZZAZIONE FINALE ===
+    cv2.imshow("Original", frame)        # Frame originale
+    cv2.imshow("Bird Eye", line_img)     # Vista bird-eye con linee
+    cv2.imshow("Info Panel", info_panel) # Pannello informativo
+    
+    # === CONTROLLO USCITA ===
+    # Esci se viene premuto 'q'
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+    
+    # Pausa per controllare la velocità di riproduzione
+    time.sleep(0.03)  # ~33 FPS
 
-except KeyboardInterrupt:
-    # Gestisce l'interruzione da tastiera (Ctrl+C) per fermare il programma in modo pulito.
-    print("Interrupted, stopping...")
-finally:
-    # === Pulizia finale ===
-    # Imposta l'angolo del servo a 0 gradi (posizione centrale).
-    px.set_dir_servo_angle(0)
-    # Ferma i motori del PicarX.
-    px.stop()
-    # Ferma la camera.
-    picam2.stop()
-    # Chiude tutte le finestre OpenCV aperte.
-    cv2.destroyAllWindows()
+# === CLEANUP ===
+# Rilascia le risorse
+picam2.stop()
+px.set_dir_servo_angle(0)
+px.stop()  # Ferma il veicolo
+cv2.destroyAllWindows()
