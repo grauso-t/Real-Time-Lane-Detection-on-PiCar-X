@@ -1,28 +1,20 @@
 import cv2
 import numpy as np
 import math
-import time
-from threading import Thread, Lock
-import signal
-import sys
+from picamera2 import Picamera2
+from time import sleep
+from picarx import Picarx
 
-# Import per PiCamera2 e PicarX
-try:
-    from picamera2 import Picamera2
-    from libcamera import controls
-    PICAMERA_AVAILABLE = True
-    print("PiCamera2 importata con successo")
-except ImportError:
-    PICAMERA_AVAILABLE = False
-    print("Attenzione: PiCamera2 non disponibile, usando video file")
+picam2 = Picamera2()
+picam2.preview_configuration.main.size = (640, 480)
+picam2.preview_configuration.main.format = "RGB888"
+picam2.preview_configuration.align()
+picam2.configure("preview")
+picam2.start()
+sleep(2)  # Aspetta l'inizializzazione
 
-try:
-    from picarx import Picarx
-    PICARX_AVAILABLE = True
-    print("PicarX importata con successo")
-except ImportError:
-    PICARX_AVAILABLE = False
-    print("Attenzione: PicarX non disponibile, solo simulazione")
+px = Picarx()
+px.forward(0)  # assicura che sia fermo
 
 # Variabili globali
 lane_width = 300  # Larghezza carreggiata in pixel
@@ -37,159 +29,6 @@ ANGLE_SMOOTHING = 0.7  # Fattore di smoothing per l'angolo (0-1)
 
 # Parametro per la posizione del centro dinamico (più piccolo = più in alto)
 CENTER_Y_RATIO = 0.3  # 0.3 significa al 30% dell'altezza (più in alto rispetto a 0.5)
-
-# Parametri per il controllo del robot PicarX
-SPEED_BASE = 30  # Velocità base del robot (0-100)
-SPEED_TURN = 20  # Velocità ridotta durante le curve
-STEERING_GAIN = 2.0  # Moltiplicatore per l'angolo di sterzo
-AUTONOMOUS_MODE = False  # Modalità autonoma on/off
-
-# Thread control
-running = True
-frame_lock = Lock()
-current_frame = None
-steering_command = 0
-speed_command = 0
-
-class PiCarXController:
-    """Classe per controllare il robot PicarX"""
-    def __init__(self):
-        self.px = None
-        self.enabled = False
-        self.last_steering = 0
-        self.last_speed = 0
-        
-        if PICARX_AVAILABLE:
-            try:
-                self.px = Picarx()
-                self.enabled = True
-                print("PicarX inizializzato con successo")
-                # Reset iniziale
-                self.px.set_dir_servo_angle(0)
-                self.px.stop()
-            except Exception as e:
-                print(f"Errore nell'inizializzazione di PicarX: {e}")
-                self.enabled = False
-        
-    def update_control(self, steering_angle, speed):
-        """Aggiorna i comandi di controllo del robot"""
-        if not self.enabled or not AUTONOMOUS_MODE:
-            return
-            
-        try:
-            # Converti l'angolo di sterzo per PicarX
-            # PicarX usa range tipicamente -30 a +30 gradi
-            picarx_steering = np.clip(steering_angle * STEERING_GAIN, -30, 30)
-            
-            # Riduci velocità durante le curve
-            abs_steering = abs(steering_angle)
-            if abs_steering > 20:
-                current_speed = SPEED_TURN
-            else:
-                current_speed = SPEED_BASE
-            
-            # Applica i comandi solo se sono cambiati significativamente
-            if abs(picarx_steering - self.last_steering) > 2:
-                self.px.set_dir_servo_angle(int(picarx_steering))
-                self.last_steering = picarx_steering
-                
-            if abs(current_speed - self.last_speed) > 5:
-                if current_speed > 0:
-                    self.px.forward(current_speed)
-                else:
-                    self.px.stop()
-                self.last_speed = current_speed
-                
-        except Exception as e:
-            print(f"Errore nel controllo PicarX: {e}")
-    
-    def emergency_stop(self):
-        """Ferma immediatamente il robot"""
-        if self.enabled:
-            try:
-                self.px.stop()
-                self.px.set_dir_servo_angle(0)
-                print("STOP di emergenza eseguito")
-            except Exception as e:
-                print(f"Errore nello stop di emergenza: {e}")
-    
-    def cleanup(self):
-        """Pulizia finale"""
-        if self.enabled:
-            try:
-                self.px.stop()
-                self.px.set_dir_servo_angle(0)
-                print("PicarX fermato e resettato")
-            except Exception as e:
-                print(f"Errore nel cleanup PicarX: {e}")
-
-class CameraHandler:
-    """Classe per gestire la camera PiCamera2"""
-    def __init__(self, resolution=(640, 480), framerate=30):
-        self.picam2 = None
-        self.enabled = False
-        self.resolution = resolution
-        self.framerate = framerate
-        
-        if PICAMERA_AVAILABLE:
-            try:
-                self.picam2 = Picamera2()
-                
-                # Configurazione camera
-                config = self.picam2.create_preview_configuration(
-                    main={"size": resolution, "format": "RGB888"}
-                )
-                self.picam2.configure(config)
-                
-                # Impostazioni ottimali per lane detection
-                self.picam2.set_controls({
-                    "AeEnable": True,
-                    "AwbEnable": True,
-                    "Brightness": 0.0,
-                    "Contrast": 1.0,
-                    "Saturation": 1.0,
-                    "Sharpness": 1.0,
-                    "ExposureTime": 10000,  # Esposizione fissa per ridurre flickering
-                })
-                
-                self.picam2.start()
-                time.sleep(2)  # Tempo per stabilizzare
-                self.enabled = True
-                print(f"PiCamera2 inizializzata: {resolution} @ {framerate}fps")
-                
-            except Exception as e:
-                print(f"Errore nell'inizializzazione PiCamera2: {e}")
-                self.enabled = False
-    
-    def capture_frame(self):
-        """Cattura un frame dalla camera"""
-        if not self.enabled:
-            return None
-            
-        try:
-            # Cattura frame come array numpy
-            frame = self.picam2.capture_array()
-            # Converti da RGB a BGR per OpenCV
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            return frame_bgr
-        except Exception as e:
-            print(f"Errore nella cattura frame: {e}")
-            return None
-    
-    def cleanup(self):
-        """Pulizia camera"""
-        if self.enabled and self.picam2:
-            try:
-                self.picam2.stop()
-                print("PiCamera2 fermata")
-            except Exception as e:
-                print(f"Errore nel cleanup camera: {e}")
-
-def signal_handler(sig, frame):
-    """Gestisce l'interruzione del programma"""
-    global running
-    print("\nInterruzione ricevuta, fermando il sistema...")
-    running = False
 
 def bird_eye_transform(frame):
     """Applica la trasformazione a occhio d'uccello"""
@@ -478,8 +317,6 @@ def draw_steering_indicator(img, steering_angle):
 
 def add_info_overlay(img, steering_angle, lane_center, valid_left, valid_right, center_y):
     """Aggiunge informazioni di testo sull'immagine"""
-    global AUTONOMOUS_MODE, SPEED_BASE
-    
     info_img = img.copy()
     
     # Informazioni di stato
@@ -488,13 +325,6 @@ def add_info_overlay(img, steering_angle, lane_center, valid_left, valid_right, 
     angle_color = (0, 255, 0) if -15 <= steering_angle <= 15 else (0, 255, 255) if -30 <= steering_angle <= 30 else (0, 0, 255)
     cv2.putText(info_img, f"Steering: {steering_angle:.1f}°", 
                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, angle_color, 2)
-    
-    y_offset += 25
-    # Stato modalità autonoma
-    mode_color = (0, 255, 0) if AUTONOMOUS_MODE else (0, 0, 255)
-    mode_text = "AUTO ON" if AUTONOMOUS_MODE else "AUTO OFF"
-    cv2.putText(info_img, f"Mode: {mode_text}", 
-               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
     
     y_offset += 25
     left_status = "OK" if valid_left else "NO"
@@ -515,9 +345,9 @@ def add_info_overlay(img, steering_angle, lane_center, valid_left, valid_right, 
                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     y_offset += 25
-    # Velocità corrente
-    cv2.putText(info_img, f"Speed: {SPEED_BASE}", 
-               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    # Mostra l'altezza del centro dinamico
+    cv2.putText(info_img, f"Center Y: {center_y}px ({CENTER_Y_RATIO:.1f})", 
+               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
     
     # Aggiungi indicatore di sterzata visuale
     info_img = draw_steering_indicator(info_img, steering_angle)
@@ -555,113 +385,46 @@ def process_frame(frame):
     
     return bird_eye, info_img, edges, steering_angle
 
-def camera_thread(camera_handler):
-    """Thread per cattura continua della camera"""
-    global current_frame, running
-    
-    while running:
-        frame = camera_handler.capture_frame()
-        if frame is not None:
-            with frame_lock:
-                current_frame = frame.copy()
-        time.sleep(0.03)  # ~30 FPS
-
 def main():
     """Funzione principale"""
-    global lane_width, ANGLE_SMOOTHING, CENTER_Y_RATIO, AUTONOMOUS_MODE, SPEED_BASE
-    global running, current_frame
+    global lane_width, ANGLE_SMOOTHING, CENTER_Y_RATIO
     
-    # Gestione segnali
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    print("=== Sistema di Rilevamento Corsie con PicarX ===")
+    print("=== Sistema di Rilevamento Corsie ===")
     print("Controlli:")
-    print("- Spazio: Play/Pause video (solo modalità file)")
+    print("- Spazio: Play/Pause")
     print("- 'q': Esci")
-    print("- 'r': Reset video (solo modalità file)")
+    print("- 'r': Reset video")
     print("- '+/-': Aumenta/Diminuisci larghezza carreggiata")
     print("- 's': Aumenta smoothing angolo")
     print("- 'a': Diminuisci smoothing angolo")
     print("- 'u': Sposta centro più in alto")
     print("- 'd': Sposta centro più in basso")
-    print("- 'o': Toggle modalità autonoma ON/OFF")
-    print("- 'w': Aumenta velocità")
-    print("- 'x': Diminuisci velocità")
-    print("- 'e': STOP di emergenza")
     print(f"- Angolo limitato tra {MIN_ANGLE}° e {MAX_ANGLE}°")
+    print(f"- Centro dinamico attualmente al {CENTER_Y_RATIO:.1f} dell'altezza")
     
-    # Inizializza componenti
-    camera_handler = None
-    car_controller = None
-    cap = None
+    # Inizializza video
+    video_path = "video.mp4"
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        print(f"Errore: Impossibile aprire il video {video_path}")
+        return
+    
+    print(f"Video caricato: {video_path}")
+    
     paused = False
     
-    try:
-        # Inizializza PicarX
-        car_controller = PiCarXController()
-        
-        # Inizializza camera o video
-        if PICAMERA_AVAILABLE:
-            camera_handler = CameraHandler()
-            if camera_handler.enabled:
-                print("Usando PiCamera2 in tempo reale")
-                # Avvia thread camera
-                camera_thread_obj = Thread(target=camera_thread, args=(camera_handler,))
-                camera_thread_obj.daemon = True
-                camera_thread_obj.start()
-            else:
-                print("Fallback a video file")
-                cap = cv2.VideoCapture("video.mp4")
-        else:
-            print("Usando video file")
-            cap = cv2.VideoCapture("video.mp4")
-            if not cap.isOpened():
-                print("Errore: Impossibile aprire il video")
-                return
-        
-        print(f"Centro dinamico al {CENTER_Y_RATIO:.1f} dell'altezza")
-        print(f"Modalità autonoma: {'ON' if AUTONOMOUS_MODE else 'OFF'}")
-        
-        last_time = time.time()
-        fps_counter = 0
-        fps_display = 0
-        
-        while running:
-            current_time = time.time()
-            fps_counter += 1
-            
-            # Calcola FPS ogni secondo
-            if current_time - last_time >= 1.0:
-                fps_display = fps_counter
-                fps_counter = 0
-                last_time = current_time
-            
-            # Ottieni frame
-            frame = None
-            if camera_handler and camera_handler.enabled:
-                with frame_lock:
-                    if current_frame is not None:
-                        frame = current_frame.copy()
-            elif cap is not None and not paused:
-                ret, frame = cap.read()
-                if not ret:
-                    if cap is not None:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Loop video
-                        continue
-            
-            if frame is None:
-                time.sleep(0.01)
-                continue
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                print("Fine del video o errore nella lettura")
+                break
             
             # Processa il frame
             bird_eye, lane_result, edges, steering_angle = process_frame(frame)
             
-            # Invia comandi al robot se in modalità autonoma
-            if car_controller:
-                car_controller.update_control(steering_angle, SPEED_BASE)
-            
-            # Prepara visualizzazione
+            # Ridimensiona tutte le immagini alle stesse dimensioni
             display_width, display_height = 350, 250
             
             frame_resized = cv2.resize(frame, (display_width, display_height))
@@ -672,201 +435,79 @@ def main():
             edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
             edges_resized = cv2.resize(edges_colored, (display_width, display_height))
             
-            # Aggiungi informazioni FPS e stato camera
-            cv2.putText(frame_resized, f"FPS: {fps_display}", 
-                       (10, display_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            cam_status = "PiCam" if (camera_handler and camera_handler.enabled) else "Video"
-            cv2.putText(frame_resized, f"Source: {cam_status}", 
-                       (10, display_height - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            
-            # Combina tutte le visualizzazioni
+            # Combina tutte le visualizzazioni con dimensioni uniformi
             top_row = np.hstack([frame_resized, bird_eye_resized])
             bottom_row = np.hstack([lane_result_resized, edges_resized])
             
             # Crea visualizzazione finale
             combined = np.vstack([top_row, bottom_row])
-            
-            # Mostra l'immagine
-            cv2.imshow('Lane Detection System - PicarX', combined)
-            
-            # Gestione input
-            key = cv2.waitKey(1) & 0xFF
-            
-            if key == ord('q'):
-                break
-            elif key == ord(' ') and cap is not None:  # Spazio per pausa/play (solo video)
-                paused = not paused
-                print("Video", "in pausa" if paused else "in riproduzione")
-            elif key == ord('r') and cap is not None:  # Reset video
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                paused = False
-                print("Video resettato")
-            elif key == ord('+') or key == ord('='):  # Aumenta larghezza carreggiata
-                lane_width = min(250, lane_width + 10)
-                print(f"Larghezza carreggiata: {lane_width}px")
-            elif key == ord('-'):  # Diminuisci larghezza carreggiata
-                lane_width = max(100, lane_width - 10)
-                print(f"Larghezza carreggiata: {lane_width}px")
-            elif key == ord('s'):  # Aumenta smoothing
-                ANGLE_SMOOTHING = min(0.9, ANGLE_SMOOTHING + 0.1)
-                print(f"Smoothing angolo: {ANGLE_SMOOTHING:.1f}")
-            elif key == ord('a'):  # Diminuisci smoothing
-                ANGLE_SMOOTHING = max(0.1, ANGLE_SMOOTHING - 0.1)
-                print(f"Smoothing angolo: {ANGLE_SMOOTHING:.1f}")
-            elif key == ord('u'):  # Sposta centro più in alto
-                CENTER_Y_RATIO = max(0.1, CENTER_Y_RATIO - 0.1)
-                print(f"Centro dinamico spostato più in alto: {CENTER_Y_RATIO:.1f}")
-            elif key == ord('d'):  # Sposta centro più in basso
-                CENTER_Y_RATIO = min(0.9, CENTER_Y_RATIO + 0.1)
-                print(f"Centro dinamico spostato più in basso: {CENTER_Y_RATIO:.1f}")
-            elif key == ord('o'):  # Toggle modalità autonoma
-                AUTONOMOUS_MODE = not AUTONOMOUS_MODE
-                print(f"Modalità autonoma: {'ON' if AUTONOMOUS_MODE else 'OFF'}")
-                if not AUTONOMOUS_MODE and car_controller:
-                    car_controller.emergency_stop()
-            elif key == ord('w'):  # Aumenta velocità
-                SPEED_BASE = min(80, SPEED_BASE + 5)
-                print(f"Velocità base: {SPEED_BASE}")
-            elif key == ord('x'):  # Diminuisci velocità
-                SPEED_BASE = max(10, SPEED_BASE - 5)
-                print(f"Velocità base: {SPEED_BASE}")
-            elif key == ord('e'):  # STOP di emergenza
-                print("STOP DI EMERGENZA!")
-                if car_controller:
-                    car_controller.emergency_stop()
-                AUTONOMOUS_MODE = False
-            elif key == ord('h'):  # Help
-                print("\n=== COMANDI DISPONIBILI ===")
-                print("Controllo Robot:")
-                print("  'o' - Toggle modalità autonoma ON/OFF")
-                print("  'w' - Aumenta velocità (+5)")
-                print("  'x' - Diminuisci velocità (-5)")
-                print("  'e' - STOP di emergenza")
-                print("\nParametri Lane Detection:")
-                print("  '+/-' - Aumenta/Diminuisci larghezza carreggiata")
-                print("  's/a' - Aumenta/Diminuisci smoothing angolo")
-                print("  'u/d' - Sposta centro rilevamento su/giù")
-                print("\nControllo Video (solo modalità file):")
-                print("  'spazio' - Play/Pausa")
-                print("  'r' - Reset video")
-                print("\nAltro:")
-                print("  'q' - Esci")
-                print("  'h' - Mostra questo help")
-                print("===============================\n")
+        
+        # Mostra l'immagine
+        cv2.imshow('Lane Detection System', combined)
+        
+        # Gestione input
+        key = cv2.waitKey(30) & 0xFF
+        
+        if key == ord('q'):
+            break
+        elif key == ord(' '):  # Spazio per pausa/play
+            paused = not paused
+            print("Video", "in pausa" if paused else "in riproduzione")
+        elif key == ord('r'):  # Reset video
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            paused = False
+            print("Video resettato")
+        elif key == ord('+') or key == ord('='):  # Aumenta larghezza carreggiata
+            lane_width = min(250, lane_width + 10)
+            print(f"Larghezza carreggiata: {lane_width}px")
+        elif key == ord('-'):  # Diminuisci larghezza carreggiata
+            lane_width = max(100, lane_width - 10)
+            print(f"Larghezza carreggiata: {lane_width}px")
+        elif key == ord('s'):  # Aumenta smoothing
+            ANGLE_SMOOTHING = min(0.9, ANGLE_SMOOTHING + 0.1)
+            print(f"Smoothing angolo: {ANGLE_SMOOTHING:.1f}")
+        elif key == ord('a'):  # Diminuisci smoothing
+            ANGLE_SMOOTHING = max(0.1, ANGLE_SMOOTHING - 0.1)
+            print(f"Smoothing angolo: {ANGLE_SMOOTHING:.1f}")
+        elif key == ord('u'):  # Sposta centro più in alto
+            CENTER_Y_RATIO = max(0.1, CENTER_Y_RATIO - 0.1)
+            print(f"Centro dinamico spostato più in alto: {CENTER_Y_RATIO:.1f}")
+        elif key == ord('d'):  # Sposta centro più in basso
+            CENTER_Y_RATIO = min(0.9, CENTER_Y_RATIO + 0.1)
+            print(f"Centro dinamico spostato più in basso: {CENTER_Y_RATIO:.1f}")
     
-    except KeyboardInterrupt:
-        print("\nInterruzione da tastiera")
-    except Exception as e:
-        print(f"Errore durante l'esecuzione: {e}")
-    finally:
-        # Cleanup
-        running = False
-        print("Cleanup in corso...")
-        
-        if car_controller:
-            car_controller.cleanup()
-        
-        if camera_handler:
-            camera_handler.cleanup()
-        
-        if cap:
-            cap.release()
-        
-        cv2.destroyAllWindows()
-        print("Sistema terminato")
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
 
-def test_picarx():
-    """Funzione di test per verificare il funzionamento di PicarX"""
-    print("=== Test PicarX ===")
-    
-    if not PICARX_AVAILABLE:
-        print("PicarX non disponibile")
-        return
-    
-    try:
-        px = Picarx()
-        print("PicarX inizializzato con successo")
+try:
+    while True:
+        # Acquisisci frame dalla fotocamera
+        frame = picam2.capture_array()
         
-        # Test movimenti base
-        print("Test sterzo sinistro...")
-        px.set_dir_servo_angle(-20)
-        time.sleep(1)
+        # Usa la funzione già definita nel tuo script
+        bird_eye, info_img, edges, steering_angle = process_frame(frame)
         
-        print("Test sterzo diritto...")
-        px.set_dir_servo_angle(0)
-        time.sleep(1)
+        # Mostra l'immagine elaborata
+        cv2.imshow("Lane Detection", info_img)
         
-        print("Test sterzo destro...")
-        px.set_dir_servo_angle(20)
-        time.sleep(1)
+        # Usa l'angolo per controllare il servomotore della direzione
+        # Map angle (-45, 45) to servo angle (0 to 180) — centered at 90
+        servo_angle = int(90 + steering_angle)
+        servo_angle = max(0, min(180, servo_angle))
+        px.set_dir_servo_angle(servo_angle)
         
-        print("Test sterzo al centro...")
-        px.set_dir_servo_angle(0)
-        time.sleep(1)
+        # Facoltativamente: muovi in avanti a bassa velocità
+        px.forward(1)
         
-        # Test movimento (commentato per sicurezza)
-        # print("Test movimento avanti...")
-        # px.forward(30)
-        # time.sleep(2)
-        # px.stop()
-        
-        print("Test completato con successo!")
-        
-    except Exception as e:
-        print(f"Errore nel test PicarX: {e}")
+        # Interrompi con 'q'
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-def test_camera():
-    """Funzione di test per verificare il funzionamento della camera"""
-    print("=== Test PiCamera2 ===")
-    
-    if not PICAMERA_AVAILABLE:
-        print("PiCamera2 non disponibile")
-        return
-    
-    try:
-        camera = CameraHandler()
-        if not camera.enabled:
-            print("Impossibile inizializzare la camera")
-            return
-        
-        print("Camera inizializzata, cattura 10 frame di test...")
-        
-        for i in range(10):
-            frame = camera.capture_frame()
-            if frame is not None:
-                print(f"Frame {i+1}: {frame.shape}")
-                # Mostra il primo frame
-                if i == 0:
-                    cv2.imshow('Test Camera', cv2.resize(frame, (640, 480)))
-                    cv2.waitKey(1000)  # Mostra per 1 secondo
-            else:
-                print(f"Errore cattura frame {i+1}")
-            time.sleep(0.1)
-        
-        camera.cleanup()
-        cv2.destroyAllWindows()
-        print("Test camera completato!")
-        
-    except Exception as e:
-        print(f"Errore nel test camera: {e}")
+except KeyboardInterrupt:
+    pass
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Sistema Lane Detection per PicarX')
-    parser.add_argument('--test-picarx', action='store_true', 
-                       help='Esegui test PicarX')
-    parser.add_argument('--test-camera', action='store_true', 
-                       help='Esegui test PiCamera2')
-    parser.add_argument('--video', type=str, default='video.mp4',
-                       help='File video da usare se PiCamera2 non disponibile')
-    
-    args = parser.parse_args()
-    
-    if args.test_picarx:
-        test_picarx()
-    elif args.test_camera:
-        test_camera()
-    else:
-        main()
+finally:
+    px.stop()
+    picam2.stop()
+    cv2.destroyAllWindows()
