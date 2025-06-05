@@ -155,24 +155,37 @@ def get_line_x_at_y(line, target_y):
     return x
 
 def validate_lines(left_line, right_line):
-    """Valida le linee rilevate"""
+    """Valida le linee rilevate con controllo posizione rispetto al centro"""
     valid_left = False
     valid_right = False
     
+    # Calcola la coordinata y per il controllo della posizione (stesso del centro dinamico)
+    center_y = int(dst_h * CENTER_Y_RATIO)
+    
     if left_line is not None:
         x1, y1, x2, y2 = left_line
-        # Controlla se la linea sinistra è effettivamente a sinistra del centro
-        if max(x1, x2) < frame_center:
-            line_length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
-            if line_length >= 20:  # Lunghezza minima
+        line_length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+        
+        # Controlla la lunghezza minima
+        if line_length >= 20:
+            # Calcola la posizione x della linea al centro dinamico
+            line_x_at_center = get_line_x_at_y(left_line, center_y)
+            
+            # La linea sinistra deve essere effettivamente a sinistra del centro
+            if line_x_at_center is not None and line_x_at_center < frame_center:
                 valid_left = True
     
     if right_line is not None:
         x1, y1, x2, y2 = right_line
-        # Controlla se la linea destra è effettivamente a destra del centro
-        if min(x1, x2) > frame_center:
-            line_length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
-            if line_length >= 20:  # Lunghezza minima
+        line_length = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+        
+        # Controlla la lunghezza minima
+        if line_length >= 20:
+            # Calcola la posizione x della linea al centro dinamico
+            line_x_at_center = get_line_x_at_y(right_line, center_y)
+            
+            # La linea destra deve essere effettivamente a destra del centro
+            if line_x_at_center is not None and line_x_at_center > frame_center:
                 valid_right = True
     
     return valid_left, valid_right
@@ -182,10 +195,35 @@ def calculate_lane_center_and_angle(left_line, right_line, valid_left, valid_rig
     global previous_angle
     
     lane_center = None
-    steering_angle = previous_angle
+    steering_angle = previous_angle  # Mantieni l'angolo precedente come default
     
     # Calcola la coordinata y per il centro dinamico (più in alto)
     center_y = int(dst_h * CENTER_Y_RATIO)
+    
+    # CONTROLLO AGGIUNTIVO: Verifica che le linee siano nella posizione corretta
+    # Se una linea è nella posizione sbagliata, la consideriamo non valida
+    position_check_passed = True
+    
+    if valid_left:
+        left_x = get_line_x_at_y(left_line, center_y)
+        if left_x is not None and left_x >= frame_center:
+            # Linea sinistra è a destra del centro - errore di rilevamento
+            valid_left = False
+            position_check_passed = False
+            print("AVVISO: Linea sinistra rilevata a destra del centro - ignorata")
+    
+    if valid_right:
+        right_x = get_line_x_at_y(right_line, center_y)
+        if right_x is not None and right_x <= frame_center:
+            # Linea destra è a sinistra del centro - errore di rilevamento
+            valid_right = False
+            position_check_passed = False
+            print("AVVISO: Linea destra rilevata a sinistra del centro - ignorata")
+    
+    # Se il controllo di posizione non è passato, mantieni l'angolo precedente
+    if not position_check_passed:
+        print(f"Mantengo angolo precedente: {previous_angle:.1f}°")
+        return lane_center, previous_angle, center_y
     
     # Se abbiamo entrambe le linee valide
     if valid_left and valid_right:
@@ -248,6 +286,9 @@ def calculate_lane_center_and_angle(left_line, right_line, valid_left, valid_rig
         
         # Aggiorna l'angolo precedente
         previous_angle = steering_angle
+    else:
+        # Se non abbiamo un centro valido, mantieni l'angolo precedente
+        print(f"Nessun centro valido - mantengo angolo precedente: {previous_angle:.1f}°")
     
     return lane_center, steering_angle, center_y
 
