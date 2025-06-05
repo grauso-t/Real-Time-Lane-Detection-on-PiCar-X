@@ -179,6 +179,9 @@ def calculate_lane_center_and_angle(left_line, right_line, valid_left, valid_rig
     """Calcola il centro della carreggiata e l'angolo di sterzata"""
     global previous_angle
     
+    # Offset di sicurezza quando si rileva solo una linea
+    SINGLE_LINE_OFFSET = 10  # pixel di offset verso il centro della strada
+    
     lane_center = None
     steering_angle = previous_angle
     
@@ -193,17 +196,19 @@ def calculate_lane_center_and_angle(left_line, right_line, valid_left, valid_rig
         if left_x is not None and right_x is not None:
             lane_center = (left_x + right_x) / 2
     
-    # Se abbiamo solo la linea sinistra
+    # Se abbiamo solo la linea sinistra - aggiungi offset verso destra
     elif valid_left and not valid_right:
         left_x = get_line_x_at_y(left_line, center_y)
         if left_x is not None:
-            lane_center = left_x + lane_width / 2
+            # Centro carreggiata stimato + offset verso destra per sicurezza
+            lane_center = left_x + lane_width / 2 + SINGLE_LINE_OFFSET
     
-    # Se abbiamo solo la linea destra
+    # Se abbiamo solo la linea destra - aggiungi offset verso sinistra
     elif valid_right and not valid_left:
         right_x = get_line_x_at_y(right_line, center_y)
         if right_x is not None:
-            lane_center = right_x - lane_width / 2
+            # Centro carreggiata stimato + offset verso sinistra per sicurezza
+            lane_center = right_x - lane_width / 2 - SINGLE_LINE_OFFSET
     
     # Calcola l'angolo di sterzata se abbiamo un centro valido
     if lane_center is not None:
@@ -492,10 +497,7 @@ try:
         cv2.imshow("Lane Detection", info_img)
         
         # Usa l'angolo per controllare il servomotore della direzione
-        # Map angle (-45, 45) to servo angle (0 to 180) — centered at 90
-        servo_angle = int(90 + steering_angle)
-        servo_angle = max(0, min(180, servo_angle))
-        px.set_dir_servo_angle(servo_angle)
+        px.set_dir_servo_angle(steering_angle)
         
         # Facoltativamente: muovi in avanti a bassa velocità
         px.forward(1)
