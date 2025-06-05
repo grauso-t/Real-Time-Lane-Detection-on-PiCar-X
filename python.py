@@ -32,6 +32,9 @@ SINGLE_LINE_OFFSET = 10  # pixel di offset verso il centro della strada
 # Parametro per la posizione del centro dinamico (più piccolo = più in alto)
 CENTER_Y_RATIO = 0.3  # 0.3 significa al 30% dell'altezza (più in alto rispetto a 0.5)
 
+# Parametro per la distanza minima dal centro (in pixel)
+MIN_DISTANCE_FROM_CENTER = 30  # Distanza minima che una linea deve avere dal centro
+
 def bird_eye_transform(frame):
     """Applica la trasformazione a occhio d'uccello"""
     h, w = frame.shape[:2]
@@ -155,7 +158,7 @@ def get_line_x_at_y(line, target_y):
     return x
 
 def validate_lines(left_line, right_line):
-    """Valida le linee rilevate con controllo posizione rispetto al centro"""
+    """Valida le linee rilevate con controllo posizione e distanza dal centro"""
     valid_left = False
     valid_right = False
     
@@ -171,8 +174,12 @@ def validate_lines(left_line, right_line):
             # Calcola la posizione x della linea al centro dinamico
             line_x_at_center = get_line_x_at_y(left_line, center_y)
             
-            # La linea sinistra deve essere effettivamente a sinistra del centro
-            if line_x_at_center is not None and line_x_at_center < frame_center:
+            # La linea sinistra deve essere:
+            # 1. A sinistra del centro
+            # 2. Sufficientemente distante dal centro
+            if (line_x_at_center is not None and 
+                line_x_at_center < frame_center and 
+                abs(line_x_at_center - frame_center) >= MIN_DISTANCE_FROM_CENTER):
                 valid_left = True
     
     if right_line is not None:
@@ -184,8 +191,12 @@ def validate_lines(left_line, right_line):
             # Calcola la posizione x della linea al centro dinamico
             line_x_at_center = get_line_x_at_y(right_line, center_y)
             
-            # La linea destra deve essere effettivamente a destra del centro
-            if line_x_at_center is not None and line_x_at_center > frame_center:
+            # La linea destra deve essere:
+            # 1. A destra del centro
+            # 2. Sufficientemente distante dal centro
+            if (line_x_at_center is not None and 
+                line_x_at_center > frame_center and 
+                abs(line_x_at_center - frame_center) >= MIN_DISTANCE_FROM_CENTER):
                 valid_right = True
     
     return valid_left, valid_right
@@ -201,24 +212,38 @@ def calculate_lane_center_and_angle(left_line, right_line, valid_left, valid_rig
     center_y = int(dst_h * CENTER_Y_RATIO)
     
     # CONTROLLO AGGIUNTIVO: Verifica che le linee siano nella posizione corretta
-    # Se una linea è nella posizione sbagliata, la consideriamo non valida
+    # e sufficientemente distanti dal centro
     position_check_passed = True
     
     if valid_left:
         left_x = get_line_x_at_y(left_line, center_y)
-        if left_x is not None and left_x >= frame_center:
-            # Linea sinistra è a destra del centro - errore di rilevamento
-            valid_left = False
-            position_check_passed = False
-            print("AVVISO: Linea sinistra rilevata a destra del centro - ignorata")
+        if left_x is not None:
+            # Controlla se la linea è nella posizione sbagliata o troppo vicina al centro
+            if left_x >= frame_center:
+                # Linea sinistra è a destra del centro - errore di rilevamento
+                valid_left = False
+                position_check_passed = False
+                print("AVVISO: Linea sinistra rilevata a destra del centro - ignorata")
+            elif abs(left_x - frame_center) < MIN_DISTANCE_FROM_CENTER:
+                # Linea sinistra troppo vicina al centro
+                valid_left = False
+                position_check_passed = False
+                print(f"AVVISO: Linea sinistra troppo vicina al centro ({abs(left_x - frame_center):.1f}px < {MIN_DISTANCE_FROM_CENTER}px) - ignorata")
     
     if valid_right:
         right_x = get_line_x_at_y(right_line, center_y)
-        if right_x is not None and right_x <= frame_center:
-            # Linea destra è a sinistra del centro - errore di rilevamento
-            valid_right = False
-            position_check_passed = False
-            print("AVVISO: Linea destra rilevata a sinistra del centro - ignorata")
+        if right_x is not None:
+            # Controlla se la linea è nella posizione sbagliata o troppo vicina al centro
+            if right_x <= frame_center:
+                # Linea destra è a sinistra del centro - errore di rilevamento
+                valid_right = False
+                position_check_passed = False
+                print("AVVISO: Linea destra rilevata a sinistra del centro - ignorata")
+            elif abs(right_x - frame_center) < MIN_DISTANCE_FROM_CENTER:
+                # Linea destra troppo vicina al centro
+                valid_right = False
+                position_check_passed = False
+                print(f"AVVISO: Linea destra troppo vicina al centro ({abs(right_x - frame_center):.1f}px < {MIN_DISTANCE_FROM_CENTER}px) - ignorata")
     
     # Se il controllo di posizione non è passato, mantieni l'angolo precedente
     if not position_check_passed:
@@ -394,6 +419,11 @@ def add_info_overlay(img, steering_angle, lane_center, valid_left, valid_right, 
     cv2.putText(info_img, f"Center Y: {center_y}px ({CENTER_Y_RATIO:.1f})", 
                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
     
+    y_offset += 25
+    # Mostra la distanza minima dal centro
+    cv2.putText(info_img, f"Min Dist: {MIN_DISTANCE_FROM_CENTER}px", 
+               (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    
     # Aggiungi indicatore di sterzata visuale
     info_img = draw_steering_indicator(info_img, steering_angle)
     
@@ -432,7 +462,7 @@ def process_frame(frame):
 
 def main():
     """Funzione principale"""
-    global lane_width, ANGLE_SMOOTHING, CENTER_Y_RATIO
+    global lane_width, ANGLE_SMOOTHING, CENTER_Y_RATIO, MIN_DISTANCE_FROM_CENTER
     
     print("=== Sistema di Rilevamento Corsie ===")
     print("Controlli:")
@@ -444,8 +474,11 @@ def main():
     print("- 'a': Diminuisci smoothing angolo")
     print("- 'u': Sposta centro più in alto")
     print("- 'd': Sposta centro più in basso")
+    print("- 'm': Aumenta distanza minima dal centro")
+    print("- 'n': Diminuisci distanza minima dal centro")
     print(f"- Angolo limitato tra {MIN_ANGLE}° e {MAX_ANGLE}°")
     print(f"- Centro dinamico attualmente al {CENTER_Y_RATIO:.1f} dell'altezza")
+    print(f"- Distanza minima dal centro: {MIN_DISTANCE_FROM_CENTER}px")
     
     # Inizializza video
     video_path = "video.mp4"
@@ -520,6 +553,12 @@ def main():
         elif key == ord('d'):  # Sposta centro più in basso
             CENTER_Y_RATIO = min(0.9, CENTER_Y_RATIO + 0.1)
             print(f"Centro dinamico spostato più in basso: {CENTER_Y_RATIO:.1f}")
+        elif key == ord('m'):  # Aumenta distanza minima dal centro
+            MIN_DISTANCE_FROM_CENTER = min(80, MIN_DISTANCE_FROM_CENTER + 5)
+            print(f"Distanza minima dal centro aumentata: {MIN_DISTANCE_FROM_CENTER}px")
+        elif key == ord('n'):  # Diminuisci distanza minima dal centro
+            MIN_DISTANCE_FROM_CENTER = max(10, MIN_DISTANCE_FROM_CENTER - 5)
+            print(f"Distanza minima dal centro diminuita: {MIN_DISTANCE_FROM_CENTER}px")
     
     # Cleanup
     cap.release()
