@@ -23,9 +23,11 @@ frame_center = 150  # Centro fisso dell'immagine (metà di 300px)
 dst_w, dst_h = 300, 200  # Dimensioni immagine trasformata
 
 # Parametri per il controllo dell'angolo
+SPEED = 1 # Velocità di movimento (1-100)
 MIN_ANGLE = -45.0  # Angolo minimo in gradi
 MAX_ANGLE = 45.0   # Angolo massimo in gradi
 ANGLE_SMOOTHING = 0.7  # Fattore di smoothing per l'angolo (0-1)
+SINGLE_LINE_OFFSET = 10  # pixel di offset verso il centro della strada
 
 # Parametro per la posizione del centro dinamico (più piccolo = più in alto)
 CENTER_Y_RATIO = 0.3  # 0.3 significa al 30% dell'altezza (più in alto rispetto a 0.5)
@@ -178,9 +180,6 @@ def validate_lines(left_line, right_line):
 def calculate_lane_center_and_angle(left_line, right_line, valid_left, valid_right):
     """Calcola il centro della carreggiata e l'angolo di sterzata"""
     global previous_angle
-    
-    # Offset di sicurezza quando si rileva solo una linea
-    SINGLE_LINE_OFFSET = 10  # pixel di offset verso il centro della strada
     
     lane_center = None
     steering_angle = previous_angle
@@ -500,12 +499,18 @@ try:
         px.set_dir_servo_angle(steering_angle)
         
         # Facoltativamente: muovi in avanti a bassa velocità
-        px.forward(1)
+        px.forward(SPEED)
         
         # Interrompi con 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+        if cv2.waitKey(1) & 0xFF == ord('p'):
+            SPEED = 0
+        
+        if cv2.waitKey(1) & 0xFF == ord('l'):
+            SPEED = 1
+            
 except KeyboardInterrupt:
     pass
 
