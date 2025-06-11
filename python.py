@@ -17,23 +17,23 @@ px = Picarx()
 px.forward(0)  # assicura che sia fermo
 
 # Variabili globali
-lane_width = 300  # Larghezza carreggiata in pixel
+lane_width = 280  # Larghezza carreggiata in pixel
 previous_angle = 0  # Angolo di sterzata precedente
 frame_center = 150  # Centro fisso dell'immagine (metà di 300px)
 dst_w, dst_h = 300, 200  # Dimensioni immagine trasformata
 
 # Parametri per il controllo dell'angolo
 SPEED = 1 # Velocità di movimento (1-100)
-MIN_ANGLE = -45.0  # Angolo minimo in gradi
-MAX_ANGLE = 45.0   # Angolo massimo in gradi
-ANGLE_SMOOTHING = 0.7  # Fattore di smoothing per l'angolo (0-1)
-SINGLE_LINE_OFFSET = 10  # pixel di offset verso il centro della strada
+MIN_ANGLE = -40.0  # Angolo minimo in gradi
+MAX_ANGLE = 40.0   # Angolo massimo in gradi
+ANGLE_SMOOTHING = 0.2  # Fattore di smoothing per l'angolo (0-1)
+SINGLE_LINE_OFFSET = 0  # pixel di offset verso il centro della strada
 
 # Parametro per la posizione del centro dinamico (più piccolo = più in alto)
-CENTER_Y_RATIO = 0.3  # 0.3 significa al 30% dell'altezza (più in alto rispetto a 0.5)
+CENTER_Y_RATIO = 0.22  # 0.3 significa al 30% dell'altezza (più in alto rispetto a 0.5)
 
 # Parametro per la distanza minima dal centro (in pixel)
-MIN_DISTANCE_FROM_CENTER = 30  # Distanza minima che una linea deve avere dal centro
+MIN_DISTANCE_FROM_CENTER = 10  # Distanza minima che una linea deve avere dal centro
 
 def bird_eye_transform(frame):
     """Applica la trasformazione a occhio d'uccello"""
@@ -459,110 +459,6 @@ def process_frame(frame):
                                valid_left, valid_right, center_y)
     
     return bird_eye, info_img, edges, steering_angle
-
-def main():
-    """Funzione principale"""
-    global lane_width, ANGLE_SMOOTHING, CENTER_Y_RATIO, MIN_DISTANCE_FROM_CENTER
-    
-    print("=== Sistema di Rilevamento Corsie ===")
-    print("Controlli:")
-    print("- Spazio: Play/Pause")
-    print("- 'q': Esci")
-    print("- 'r': Reset video")
-    print("- '+/-': Aumenta/Diminuisci larghezza carreggiata")
-    print("- 's': Aumenta smoothing angolo")
-    print("- 'a': Diminuisci smoothing angolo")
-    print("- 'u': Sposta centro più in alto")
-    print("- 'd': Sposta centro più in basso")
-    print("- 'm': Aumenta distanza minima dal centro")
-    print("- 'n': Diminuisci distanza minima dal centro")
-    print(f"- Angolo limitato tra {MIN_ANGLE}° e {MAX_ANGLE}°")
-    print(f"- Centro dinamico attualmente al {CENTER_Y_RATIO:.1f} dell'altezza")
-    print(f"- Distanza minima dal centro: {MIN_DISTANCE_FROM_CENTER}px")
-    
-    # Inizializza video
-    video_path = "video.mp4"
-    cap = cv2.VideoCapture(video_path)
-    
-    if not cap.isOpened():
-        print(f"Errore: Impossibile aprire il video {video_path}")
-        return
-    
-    print(f"Video caricato: {video_path}")
-    
-    paused = False
-    
-    while True:
-        if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                print("Fine del video o errore nella lettura")
-                break
-            
-            # Processa il frame
-            bird_eye, lane_result, edges, steering_angle = process_frame(frame)
-            
-            # Ridimensiona tutte le immagini alle stesse dimensioni
-            display_width, display_height = 350, 250
-            
-            frame_resized = cv2.resize(frame, (display_width, display_height))
-            bird_eye_resized = cv2.resize(bird_eye, (display_width, display_height))
-            lane_result_resized = cv2.resize(lane_result, (display_width, display_height))
-            
-            # Crea immagine degli edges a colori per la visualizzazione
-            edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-            edges_resized = cv2.resize(edges_colored, (display_width, display_height))
-            
-            # Combina tutte le visualizzazioni con dimensioni uniformi
-            top_row = np.hstack([frame_resized, bird_eye_resized])
-            bottom_row = np.hstack([lane_result_resized, edges_resized])
-            
-            # Crea visualizzazione finale
-            combined = np.vstack([top_row, bottom_row])
-        
-        # Mostra l'immagine
-        cv2.imshow('Lane Detection System', combined)
-        
-        # Gestione input
-        key = cv2.waitKey(30) & 0xFF
-        
-        if key == ord('q'):
-            break
-        elif key == ord(' '):  # Spazio per pausa/play
-            paused = not paused
-            print("Video", "in pausa" if paused else "in riproduzione")
-        elif key == ord('r'):  # Reset video
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            paused = False
-            print("Video resettato")
-        elif key == ord('+') or key == ord('='):  # Aumenta larghezza carreggiata
-            lane_width = min(250, lane_width + 10)
-            print(f"Larghezza carreggiata: {lane_width}px")
-        elif key == ord('-'):  # Diminuisci larghezza carreggiata
-            lane_width = max(100, lane_width - 10)
-            print(f"Larghezza carreggiata: {lane_width}px")
-        elif key == ord('s'):  # Aumenta smoothing
-            ANGLE_SMOOTHING = min(0.9, ANGLE_SMOOTHING + 0.1)
-            print(f"Smoothing angolo: {ANGLE_SMOOTHING:.1f}")
-        elif key == ord('a'):  # Diminuisci smoothing
-            ANGLE_SMOOTHING = max(0.1, ANGLE_SMOOTHING - 0.1)
-            print(f"Smoothing angolo: {ANGLE_SMOOTHING:.1f}")
-        elif key == ord('u'):  # Sposta centro più in alto
-            CENTER_Y_RATIO = max(0.1, CENTER_Y_RATIO - 0.1)
-            print(f"Centro dinamico spostato più in alto: {CENTER_Y_RATIO:.1f}")
-        elif key == ord('d'):  # Sposta centro più in basso
-            CENTER_Y_RATIO = min(0.9, CENTER_Y_RATIO + 0.1)
-            print(f"Centro dinamico spostato più in basso: {CENTER_Y_RATIO:.1f}")
-        elif key == ord('m'):  # Aumenta distanza minima dal centro
-            MIN_DISTANCE_FROM_CENTER = min(80, MIN_DISTANCE_FROM_CENTER + 5)
-            print(f"Distanza minima dal centro aumentata: {MIN_DISTANCE_FROM_CENTER}px")
-        elif key == ord('n'):  # Diminuisci distanza minima dal centro
-            MIN_DISTANCE_FROM_CENTER = max(10, MIN_DISTANCE_FROM_CENTER - 5)
-            print(f"Distanza minima dal centro diminuita: {MIN_DISTANCE_FROM_CENTER}px")
-    
-    # Cleanup
-    cap.release()
-    cv2.destroyAllWindows()
 
 try:
     while True:
